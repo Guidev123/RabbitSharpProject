@@ -136,18 +136,25 @@ namespace RabbitSharp.Builders
         }
 
         /// <summary>Marks the queue as lazy.</summary>
+        /// <remarks>
+        /// <c>x-queue-mode</c> has been deprecated and ignored since RabbitMQ 3.12, which replaced it
+        /// with per-queue message versions, so this sets an argument modern brokers do nothing with.
+        /// </remarks>
+        [Obsolete("x-queue-mode is deprecated and ignored since RabbitMQ 3.12; the broker decides what to keep in memory on its own.")]
         public QueueBuilder AsLazyQueue()
         {
             _config.Arguments["x-queue-mode"] = "lazy";
             return this;
         }
 
-        /// <summary>Configures the queue for high-volume processing.</summary>
+        /// <summary>
+        /// Configures the queue for high-volume processing: a high length limit, and a publish that is
+        /// rejected once that limit is reached rather than silently destroying the oldest message.
+        /// </summary>
         public QueueBuilder ForHighVolume()
         {
             return WithMaxLength(100000)
-                   .WithOverflowBehavior(OverFlowStrategyEnum.DropHead)
-                   .AsLazyQueue();
+                   .WithOverflowBehavior(OverFlowStrategyEnum.RejectPublish);
         }
     }
 }

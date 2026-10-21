@@ -58,5 +58,26 @@ namespace RabbitSharp.UnitTests.Core
             Assert.Equal("2001:db8::1", host);
             Assert.Equal(5672, port);
         }
+
+        [Theory]
+        [InlineData("localhost:99999")]
+        [InlineData("localhost:65536")]
+        [InlineData("localhost:0")]
+        [InlineData("localhost:-1")]
+        [InlineData("[::1]:99999")]
+        public void ParseHostAndPort_PortOutOfRange_Throws(string host)
+        {
+            Assert.Throws<ArgumentException>(() => ConnectionManager.ParseHostAndPort(host, 5672));
+        }
+
+        [Theory]
+        [InlineData("localhost:")]
+        [InlineData("localhost:amqp")]
+        [InlineData("[::1]:")]
+        [InlineData("[::1]x")]
+        public void ParseHostAndPort_MalformedEntry_ThrowsInsteadOfReturningItAsAHostName(string host)
+        {
+            Assert.Throws<ArgumentException>(() => ConnectionManager.ParseHostAndPort(host, 5672));
+        }
     }
 }

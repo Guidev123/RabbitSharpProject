@@ -40,13 +40,18 @@ namespace RabbitSharp.IntegrationTests
                 throw new InvalidOperationException("svcA always fails (simulated downstream failure)");
             });
 
-            await Task.Delay(500);
-
             var testEvent = new FanoutTestEvent(Guid.NewGuid());
             await bus.PublishAsync(testEvent);
 
-            // Give the retry -> TTL-expiry -> dead-letter cycle time to fully complete.
-            await Task.Delay(3000);
+            await Wait.UntilAsync(
+                () => svcAAttempts.Count(id => id == testEvent.CorrelationId) == 2,
+                "the failing subscriber has had its one retry");
+
+            // svcA's retry must not reach svcB: it is republished to svcA's own retry queue, not back
+            // through the shared exchange.
+            await Wait.StaysFalseAsync(
+                () => svcBReceived.Count(id => id == testEvent.CorrelationId) > 1,
+                "the other subscriber receiving the retry");
 
             Assert.Equal(1, svcBReceived.Count(id => id == testEvent.CorrelationId));
             Assert.Equal(2, svcAAttempts.Count(id => id == testEvent.CorrelationId));
@@ -68,11 +73,12 @@ namespace RabbitSharp.IntegrationTests
             await bus.SubscribeAsync<FanoutTestEvent>("fanout.dlq.queue", _ =>
                 throw new InvalidOperationException("always fails"));
 
-            await Task.Delay(500);
-
             var testEvent = new FanoutTestEvent(Guid.NewGuid());
             await bus.PublishAsync(testEvent);
-            await Task.Delay(3000);
+
+            await Wait.UntilAsync(
+                async () => await _fixture.GetQueueDepthAsync("fanout.dlq.queue.deadletter") == 1,
+                "the exhausted message reaches its dead-letter queue");
 
             await using var rawConnection = await _fixture.CreateRawConnectionAsync();
             await using var rawChannel = await rawConnection.CreateChannelAsync();

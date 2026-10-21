@@ -28,11 +28,12 @@ namespace RabbitSharp.IntegrationTests
             await bus.SubscribeAsync<OrderCreated>("basic.orders.queue",
                 msg => { received.Add(msg); return Task.CompletedTask; });
 
-            await Task.Delay(500);
-
             var order = new OrderCreated(Guid.NewGuid(), "Ada Lovelace");
             await bus.PublishAsync(order);
-            await Task.Delay(800);
+
+            await Wait.UntilAsync(
+                () => received.Any(m => m.CorrelationId == order.CorrelationId),
+                "the published order is handled");
 
             var match = Assert.Single(received, m => m.CorrelationId == order.CorrelationId);
             Assert.Equal(order.CustomerName, match.CustomerName);
@@ -58,8 +59,6 @@ namespace RabbitSharp.IntegrationTests
                     .Build(),
                 msg => { received.Add(msg.CorrelationId); return Task.CompletedTask; });
 
-            await Task.Delay(500);
-
             var order = new OrderCreated(Guid.NewGuid(), "Grace Hopper");
             var publisherOptions = new PublisherOptionsBuilder()
                 .WithExchange(e =>
@@ -71,9 +70,10 @@ namespace RabbitSharp.IntegrationTests
                 .Build();
 
             await bus.PublishAsync(publisherOptions, order);
-            await Task.Delay(800);
 
-            Assert.Contains(order.CorrelationId, received);
+            await Wait.UntilAsync(
+                () => received.Contains(order.CorrelationId),
+                "the direct-exchange message is handled");
         }
     }
 }

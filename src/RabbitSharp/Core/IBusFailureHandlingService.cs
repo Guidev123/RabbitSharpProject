@@ -1,4 +1,4 @@
-﻿using RabbitMQ.Client;
+using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using RabbitSharp.Abstractions;
 using RabbitSharp.Options;
@@ -21,13 +21,21 @@ namespace RabbitSharp.Core
         /// <param name="options">
         /// The bus infrastructure configuration, including exchange and queue definitions.
         /// </param>
+        /// <param name="busResilience">
+        /// The retry configuration, which determines how many per-delay retry queues are declared and
+        /// what fixed <c>x-message-ttl</c> each one carries.
+        /// </param>
         /// <param name="channel">
         /// The AMQP channel used to declare the necessary infrastructure.
         /// </param>
         /// <param name="cancellationToken">
         /// A token to observe while waiting for the operation to complete. Defaults to <see cref="CancellationToken.None"/>.
         /// </param>
-        Task DeclareInfrastructureAsync<T>(BusInfrastructureOptions options, IChannel channel, CancellationToken cancellationToken = default)
+        Task DeclareInfrastructureAsync<T>(
+            BusInfrastructureOptions options,
+            BusResilienceOptions busResilience,
+            IChannel channel,
+            CancellationToken cancellationToken = default)
             where T : IMessage;
 
         /// <summary>
@@ -42,13 +50,14 @@ namespace RabbitSharp.Core
         int GetRetryCount(IReadOnlyBasicProperties? properties);
 
         /// <summary>
-        /// Publishes a message to the retry queue for reprocessing.
+        /// Publishes a message to the retry queue that matches this attempt's backoff delay, for
+        /// reprocessing once that queue's fixed TTL expires.
         /// </summary>
         /// <param name="eventArgs">
         /// The original message delivery event arguments.
         /// </param>
         /// <param name="queueName">
-        /// The base queue name associated with the message.
+        /// The base retry queue name; the per-delay queue name is derived from it.
         /// </param>
         /// <param name="retryCount">
         /// The number of times the message has been retried.

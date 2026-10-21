@@ -9,6 +9,14 @@ namespace RabbitSharp.Abstractions
     public interface IBus : IDisposable, IAsyncDisposable
     {
         /// <summary>
+        /// Raised when a subscription stops consuming for a reason nothing else surfaces: the broker
+        /// cancelled the consumer (deleted or expired queue, policy change, cluster failover) or the
+        /// subscription's channel closed unexpectedly. Neither case throws, so handle this to report
+        /// unhealthy or to re-subscribe - otherwise the queue just grows with no error anywhere.
+        /// </summary>
+        event Func<SubscriptionInterruptedEventArgs, Task>? SubscriptionInterrupted;
+
+        /// <summary>
         /// Publishes a message to the bus using the default configuration.
         /// </summary>
         /// <typeparam name="T">
@@ -20,6 +28,9 @@ namespace RabbitSharp.Abstractions
         /// <param name="cancellationToken">
         /// Optional cancellation token to abort the operation.
         /// </param>
+        /// <exception cref="ArgumentNullException">
+        /// Thrown if <paramref name="message"/> is <see langword="null"/>.
+        /// </exception>
         Task PublishAsync<T>(T message, CancellationToken cancellationToken = default)
             where T : IMessage;
 
@@ -38,6 +49,9 @@ namespace RabbitSharp.Abstractions
         /// <param name="cancellationToken">
         /// Optional cancellation token to abort the operation.
         /// </param>
+        /// <exception cref="ArgumentNullException">
+        /// Thrown if <paramref name="options"/> or <paramref name="message"/> is <see langword="null"/>.
+        /// </exception>
         Task PublishAsync<T>(PublisherOptions options, T message, CancellationToken cancellationToken = default)
              where T : IMessage;
 

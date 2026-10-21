@@ -39,15 +39,14 @@ namespace RabbitSharp.IntegrationTests
             await bus.SubscribeAsync<BoundEvent>("confirmations.bound.queue",
                 msg => { received.Add(msg.CorrelationId); return Task.CompletedTask; });
 
-            await Task.Delay(500);
-
             var testEvent = new BoundEvent(Guid.NewGuid());
             var exception = await Record.ExceptionAsync(() => bus.PublishAsync(testEvent));
 
-            await Task.Delay(500);
-
             Assert.Null(exception);
-            Assert.Contains(testEvent.CorrelationId, received);
+
+            await Wait.UntilAsync(
+                () => received.Contains(testEvent.CorrelationId),
+                "the confirmed message is handled");
         }
     }
 }

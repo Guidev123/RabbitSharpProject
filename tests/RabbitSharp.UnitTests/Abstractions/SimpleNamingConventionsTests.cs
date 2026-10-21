@@ -18,18 +18,12 @@ namespace RabbitSharp.UnitTests.Abstractions
             Assert.Equal("ordercreated", name);
         }
 
-        [Fact]
-        public void RoutingKeyNamingConvention_Topic_ReturnsWildcardPattern()
+        [Theory]
+        [InlineData(ExchangeTypeEnum.Topic)]
+        [InlineData(ExchangeTypeEnum.Direct)]
+        public void RoutingKeyNamingConvention_ReturnsConcreteKeyWithoutWildcards(ExchangeTypeEnum exchangeType)
         {
-            var key = _sut.RoutingKeyNamingConvention(typeof(OrderCreated), ExchangeTypeEnum.Topic);
-
-            Assert.Equal("OrderCreated.#", key);
-        }
-
-        [Fact]
-        public void RoutingKeyNamingConvention_Direct_ReturnsTypeName()
-        {
-            var key = _sut.RoutingKeyNamingConvention(typeof(OrderCreated), ExchangeTypeEnum.Direct);
+            var key = _sut.RoutingKeyNamingConvention(typeof(OrderCreated), exchangeType);
 
             Assert.Equal("OrderCreated", key);
         }
@@ -40,6 +34,30 @@ namespace RabbitSharp.UnitTests.Abstractions
             var key = _sut.RoutingKeyNamingConvention(typeof(OrderCreated), ExchangeTypeEnum.Fanout);
 
             Assert.Equal(string.Empty, key);
+        }
+
+        [Fact]
+        public void BindingPatternNamingConvention_Topic_ReturnsWildcardPattern()
+        {
+            var pattern = _sut.BindingPatternNamingConvention(typeof(OrderCreated), ExchangeTypeEnum.Topic);
+
+            Assert.Equal("OrderCreated.#", pattern);
+        }
+
+        [Fact]
+        public void BindingPatternNamingConvention_Direct_ReturnsTypeName()
+        {
+            var pattern = _sut.BindingPatternNamingConvention(typeof(OrderCreated), ExchangeTypeEnum.Direct);
+
+            Assert.Equal("OrderCreated", pattern);
+        }
+
+        [Fact]
+        public void BindingPatternNamingConvention_Fanout_ReturnsEmpty()
+        {
+            var pattern = _sut.BindingPatternNamingConvention(typeof(OrderCreated), ExchangeTypeEnum.Fanout);
+
+            Assert.Equal(string.Empty, pattern);
         }
     }
 }

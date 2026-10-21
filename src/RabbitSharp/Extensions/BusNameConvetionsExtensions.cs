@@ -1,4 +1,4 @@
-﻿using RabbitSharp.Abstractions;
+using RabbitSharp.Abstractions;
 using RabbitSharp.Enums;
 
 namespace RabbitSharp.Extensions
@@ -13,6 +13,11 @@ namespace RabbitSharp.Extensions
         public static string GetRoutingKey<T>(this INamingConventions conventions, ExchangeTypeEnum exchangeType = ExchangeTypeEnum.Topic) where T : IMessage
         {
             return conventions.RoutingKeyNamingConvention(typeof(T), exchangeType);
+        }
+
+        public static string GetBindingPattern<T>(this INamingConventions conventions, ExchangeTypeEnum exchangeType = ExchangeTypeEnum.Topic) where T : IMessage
+        {
+            return conventions.BindingPatternNamingConvention(typeof(T), exchangeType);
         }
     }
 }

@@ -29,9 +29,7 @@ namespace RabbitSharp.IntegrationTests
             await bus.SubscribeAsync<IsolationTestEvent>("isolation.queue",
                 msg => { received.Add(msg.CorrelationId); return Task.CompletedTask; });
 
-            await Task.Delay(500);
-
-            // Redeclares the SAME queue with a conflicting x-overflow argument, forcing the broker
+            // Redeclares the SAME queue with a conflicting x-max-length argument, forcing the broker
             // to reject with 406 PRECONDITION_FAILED. This closes only this SubscribeAsync call's
             // own channel.
             await Assert.ThrowsAnyAsync<Exception>(() => bus.SubscribeAsync<IsolationTestEvent>(
@@ -41,18 +39,20 @@ namespace RabbitSharp.IntegrationTests
                         e.WithName("isolationtestevent");
                         e.WithType(ExchangeTypeEnum.Topic);
                     })
-                    .WithRoutingKey("IsolationTestEvent.#")
-                    .WithMainQueue(q => q.WithOverflowBehavior(OverFlowStrategyEnum.RejectPublish))
+                    .WithRoutingKey("IsolationTestEvent")
+                    .WithBindingPattern("IsolationTestEvent.#")
+                    .WithMainQueue(q => q.WithMaxLength(123))
                     .Build(),
                 _ => Task.CompletedTask));
 
             var survivorEvent = new IsolationTestEvent(Guid.NewGuid());
             var publishException = await Record.ExceptionAsync(() => bus.PublishAsync(survivorEvent));
 
-            await Task.Delay(1000);
-
             Assert.Null(publishException);
-            Assert.Contains(survivorEvent.CorrelationId, received);
+
+            await Wait.UntilAsync(
+                () => received.Contains(survivorEvent.CorrelationId),
+                "the surviving subscription still handles messages");
         }
     }
 }

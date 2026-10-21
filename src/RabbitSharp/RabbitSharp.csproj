@@ -8,7 +8,7 @@
 		<!-- Package Metadata -->
 		<PackageId>RabbitSharp</PackageId>
 		<Title>RabbitSharp</Title>
-		<Description>A high-performance, highly customizable RabbitMQ Pub/Sub library for .NET 8+ applications with built-in retry mechanisms and dead letter queue support.</Description>
+		<Description>A highly customizable RabbitMQ Pub/Sub library for .NET 8+ applications with built-in retry mechanisms and dead letter queue support.</Description>
 		<Summary>RabbitMQ Pub/Sub library with retry mechanisms, dead letter queues, and convention-based configuration for .NET 8+</Summary>
 		<PackageTags>rabbitmq;pubsub;messaging;dotnet;retry;deadletter;queue;resilience</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -34,11 +34,6 @@
 
 	</PropertyGroup>
 
-	<!--
-		Versions bumped above each TFM's own baseline to satisfy what Microsoft.Extensions.Resilience
-		pulls in transitively (Microsoft.Extensions.Diagnostics.ExceptionSummarization /
-		Telemetry.Abstractions) - NuGet treats anything lower as a downgrade error (NU1605).
-	-->
 	<!-- .NET 8.0 Dependencies -->
 	<ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
@@ -57,9 +52,15 @@
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.13" />
 	</ItemGroup>
 
+	<!--
+		Polly.Core directly, not Microsoft.Extensions.Resilience: the only thing used here is Polly's
+		ResiliencePipelineBuilder, and Resilience dragged Microsoft.Extensions.Diagnostics/Telemetry 10.x
+		into every consumer - net8 ones included - along with the version bumps needed to keep NuGet from
+		reporting a downgrade (NU1605).
+	-->
 	<!-- Common Dependencies for all frameworks -->
 	<ItemGroup>
-		<PackageReference Include="Microsoft.Extensions.Resilience" Version="10.11.0" />
+		<PackageReference Include="Polly.Core" Version="8.7.0" />
 		<PackageReference Include="RabbitMQ.Client" Version="7.1.2" />
 	</ItemGroup>
 

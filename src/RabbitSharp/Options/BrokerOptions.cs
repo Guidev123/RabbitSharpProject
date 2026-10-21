@@ -7,6 +7,8 @@ namespace RabbitSharp.Options
     {
         /// <summary>
         /// The maximum number of attempts to reconnect to the broker if the initial connection fails.
+        /// Only transient failures are retried: a wrong password or a missing virtual host fails
+        /// immediately instead of spending the whole backoff budget on something that cannot succeed.
         /// Default is <c>5</c>.
         /// </summary>
         public int TryConnectMaxRetries { get; set; } = 5;
@@ -24,8 +26,24 @@ namespace RabbitSharp.Options
         /// <see cref="TimeoutException"/>. Only applies after the first successful connect - the
         /// initial connect is governed by <see cref="TryConnectMaxRetries"/>/<see cref="MaxConnectRetryDelay"/>
         /// instead. Default is <c>30 seconds</c>.
+        /// <para>
+        /// A publish issued while the connection is down blocks for up to this long, so a request-path
+        /// publish inherits it as its own latency; lower it, or use
+        /// <see cref="RecoveryFailFastWindow"/>, when failing fast matters more than riding out a
+        /// short outage.
+        /// </para>
         /// </summary>
         public TimeSpan AutomaticRecoveryWaitTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// Once a wait for automatic recovery has timed out, every further call fails immediately for
+        /// this long instead of each one paying the full <see cref="AutomaticRecoveryWaitTimeout"/> -
+        /// the circuit stays open for this window, and the first call after it tries again. The first
+        /// successful connection closes it early.
+        /// Set to <see cref="TimeSpan.Zero"/> to disable fail-fast and have every call wait.
+        /// Default is <c>5 seconds</c>.
+        /// </summary>
+        public TimeSpan RecoveryFailFastWindow { get; set; } = TimeSpan.FromSeconds(5);
 
         /// <summary>
         /// The interval, in seconds, between reconnection attempts.
@@ -101,7 +119,8 @@ namespace RabbitSharp.Options
         /// <summary>
         /// Validates required fields, throwing <see cref="ArgumentException"/> with a precise message
         /// instead of letting a misconfiguration surface as a <see cref="NullReferenceException"/> deep
-        /// inside <c>ConnectionFactory</c>.
+        /// inside <c>ConnectionFactory</c>, or as a DNS failure far from the malformed host entry that
+        /// caused it.
         /// </summary>
         public void Validate()
         {
@@ -110,6 +129,24 @@ namespace RabbitSharp.Options
 
             if (Array.Exists(Hosts, string.IsNullOrWhiteSpace))
                 throw new ArgumentException("BrokerOptions.Hosts must not contain null or empty entries.", nameof(Hosts));
+
+            if (Port != -1 && !BrokerEndpointParser.IsValidPort(Port))
+                throw new ArgumentException(
+                    $"BrokerOptions.Port must be -1 (the AMQP protocol default) or between " +
+                    $"{BrokerEndpointParser.MinPort} and {BrokerEndpointParser.MaxPort}.",
+                    nameof(Port));
+
+            foreach (var host in Hosts)
+            {
+                try
+                {
+                    BrokerEndpointParser.Parse(host, Port);
+                }
+                catch (ArgumentException ex)
+                {
+                    throw new ArgumentException($"BrokerOptions.Hosts: {ex.Message}", nameof(Hosts), ex);
+                }
+            }
 
             if (string.IsNullOrWhiteSpace(Username))
                 throw new ArgumentException("BrokerOptions.Username must be provided.", nameof(Username));
@@ -131,6 +168,9 @@ namespace RabbitSharp.Options
 
             if (AutomaticRecoveryWaitTimeout <= TimeSpan.Zero)
                 throw new ArgumentException("BrokerOptions.AutomaticRecoveryWaitTimeout must be > 0.", nameof(AutomaticRecoveryWaitTimeout));
+
+            if (RecoveryFailFastWindow < TimeSpan.Zero)
+                throw new ArgumentException("BrokerOptions.RecoveryFailFastWindow must be >= 0.", nameof(RecoveryFailFastWindow));
 
             if (PrefetchCount == 0)
                 throw new ArgumentException("BrokerOptions.PrefetchCount must be > 0.", nameof(PrefetchCount));

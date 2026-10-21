@@ -22,6 +22,12 @@ namespace RabbitSharp.Core
         private IChannel? _publishChannel;
         private bool _disposed;
 
+        /// <summary>
+        /// When the fail-fast window opened by the last recovery timeout expires, as UTC ticks; 0 when
+        /// no window is open.
+        /// </summary>
+        private long _recoveryFailFastUntilTicks;
+
         public ConnectionManager(
             BrokerOptions brokerOptions,
             ILogger<ConnectionManager> logger)
@@ -52,10 +58,7 @@ namespace RabbitSharp.Core
             return new ResiliencePipelineBuilder()
                 .AddRetry(new RetryStrategyOptions
                 {
-                    ShouldHandle = new PredicateBuilder()
-                        .Handle<BrokerUnreachableException>()
-                        .Handle<IOException>()
-                        .Handle<SocketException>(),
+                    ShouldHandle = args => new ValueTask<bool>(IsTransientConnectFailure(args.Outcome.Exception)),
                     MaxRetryAttempts = brokerOptions.TryConnectMaxRetries,
                     BackoffType = DelayBackoffType.Exponential,
                     UseJitter = false,
@@ -70,6 +73,36 @@ namespace RabbitSharp.Core
                     }
                 })
                 .Build();
+        }
+
+        /// <summary>
+        /// Whether a failed connect attempt is worth retrying. A broker that is down, unreachable or
+        /// slow is; a rejected credential or a missing virtual host is not - those arrive wrapped in
+        /// the same <see cref="BrokerUnreachableException"/> but will fail identically on every
+        /// attempt, so retrying only delays the error by the whole backoff budget.
+        /// </summary>
+        private static bool IsTransientConnectFailure(Exception? exception)
+        {
+            return exception switch
+            {
+                null => false,
+                BrokerUnreachableException broker => !IsPermanentConnectFailure(broker),
+                IOException => true,
+                SocketException => true,
+                _ => false
+            };
+        }
+
+        private static bool IsPermanentConnectFailure(Exception? exception)
+        {
+            return exception switch
+            {
+                null => false,
+                AuthenticationFailureException => true,
+                OperationInterruptedException => true,
+                AggregateException aggregate => aggregate.InnerExceptions.Any(IsPermanentConnectFailure),
+                _ => IsPermanentConnectFailure(exception.InnerException)
+            };
         }
 
         public bool IsConnected => _connection?.IsOpen == true;
@@ -105,6 +138,11 @@ namespace RabbitSharp.Core
 
         private async Task WaitForAutomaticRecoveryAsync(CancellationToken cancellationToken)
         {
+            if (IsRecoveryFailFastWindowOpen())
+            {
+                throw BuildRecoveryTimeoutException(failedFast: true);
+            }
+
             using var timeoutCts = new CancellationTokenSource(_brokerOptions.AutomaticRecoveryWaitTimeout);
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 
@@ -117,12 +155,53 @@ namespace RabbitSharp.Core
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
-                throw new TimeoutException(
-                    $"RabbitMQ connection is down and automatic recovery did not complete within " +
-                    $"{_brokerOptions.AutomaticRecoveryWaitTimeout}. The connection was left in place (not replaced) " +
-                    "so active subscriptions are not orphaned; increase BrokerOptions.AutomaticRecoveryWaitTimeout " +
-                    "if recovery is simply slow, or investigate why automatic recovery is not completing.");
+                OpenRecoveryFailFastWindow();
+                throw BuildRecoveryTimeoutException(failedFast: false);
             }
+
+            CloseRecoveryFailFastWindow();
+        }
+
+        private bool IsRecoveryFailFastWindowOpen()
+        {
+            if (_brokerOptions.RecoveryFailFastWindow <= TimeSpan.Zero)
+            {
+                return false;
+            }
+
+            var until = Volatile.Read(ref _recoveryFailFastUntilTicks);
+            return until != 0 && DateTime.UtcNow.Ticks < until;
+        }
+
+        private void OpenRecoveryFailFastWindow()
+        {
+            if (_brokerOptions.RecoveryFailFastWindow <= TimeSpan.Zero)
+            {
+                return;
+            }
+
+            Volatile.Write(ref _recoveryFailFastUntilTicks, (DateTime.UtcNow + _brokerOptions.RecoveryFailFastWindow).Ticks);
+        }
+
+        private void CloseRecoveryFailFastWindow()
+        {
+            Volatile.Write(ref _recoveryFailFastUntilTicks, 0);
+        }
+
+        private TimeoutException BuildRecoveryTimeoutException(bool failedFast)
+        {
+            var reason = failedFast
+                ? $"A previous wait already timed out, so this call failed immediately rather than waiting " +
+                  $"{_brokerOptions.AutomaticRecoveryWaitTimeout} again (BrokerOptions.RecoveryFailFastWindow = " +
+                  $"{_brokerOptions.RecoveryFailFastWindow}). "
+                : $"Automatic recovery did not complete within {_brokerOptions.AutomaticRecoveryWaitTimeout}. ";
+
+            return new TimeoutException(
+                "RabbitMQ connection is down. " + reason +
+                "The connection was left in place (not replaced) so active subscriptions are not orphaned; " +
+                "increase BrokerOptions.AutomaticRecoveryWaitTimeout if recovery is simply slow, lower it (or " +
+                "BrokerOptions.RecoveryFailFastWindow) to fail faster, or investigate why automatic recovery is " +
+                "not completing.");
         }
 
         public async Task<IChannel> GetPublishChannelAsync(CancellationToken cancellationToken = default)
@@ -208,6 +287,8 @@ namespace RabbitSharp.Core
                 _connection = connection;
                 _publishChannel = await OpenChannelAsync(cancellationToken);
 
+                CloseRecoveryFailFastWindow();
+
                 _logger.LogInformation("Successfully connected to RabbitMQ ({Endpoints})",
                     string.Join(", ", endpoints.Select(e => $"{e.HostName}:{e.Port}")));
             }
@@ -245,36 +326,12 @@ namespace RabbitSharp.Core
         /// <summary>
         /// Parses a <c>"host"</c> or <c>"host:port"</c> entry (and the bracketed IPv6 forms
         /// <c>"[::1]"</c> / <c>"[::1]:5672"</c>), falling back to <paramref name="defaultPort"/> when
-        /// no port is present.
+        /// no port is present. Rejects out-of-range ports and trailing colons; by the time this runs,
+        /// <see cref="BrokerOptions.Validate"/> has already reported those against <c>Hosts</c>.
         /// </summary>
         internal static (string Host, int Port) ParseHostAndPort(string host, int defaultPort)
         {
-            if (host.Length > 0 && host[0] == '[')
-            {
-                var closeBracket = host.IndexOf(']');
-                if (closeBracket > 0)
-                {
-                    var hostPart = host[1..closeBracket];
-                    var rest = host[(closeBracket + 1)..];
-
-                    if (rest.Length > 1 && rest[0] == ':' && int.TryParse(rest.AsSpan(1), out var ipv6Port))
-                    {
-                        return (hostPart, ipv6Port);
-                    }
-
-                    return (hostPart, defaultPort);
-                }
-            }
-
-            var firstColon = host.IndexOf(':');
-            var lastColon = host.LastIndexOf(':');
-
-            if (firstColon > 0 && firstColon == lastColon && int.TryParse(host.AsSpan(lastColon + 1), out var port))
-            {
-                return (host[..lastColon], port);
-            }
-
-            return (host, defaultPort);
+            return BrokerEndpointParser.Parse(host, defaultPort);
         }
 
         private Task OnChannelShutdownAsync(object sender, ShutdownEventArgs args)
@@ -303,6 +360,8 @@ namespace RabbitSharp.Core
 
         private Task OnRecoverySucceededAsync(object sender, AsyncEventArgs args)
         {
+            CloseRecoveryFailFastWindow();
+
             _logger.LogInformation("RabbitMQ connection automatically recovered.");
             return Task.CompletedTask;
         }

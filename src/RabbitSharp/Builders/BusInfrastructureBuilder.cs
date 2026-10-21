@@ -1,4 +1,4 @@
-﻿using RabbitSharp.Options;
+using RabbitSharp.Options;
 
 namespace RabbitSharp.Builders
 {
@@ -22,6 +22,13 @@ namespace RabbitSharp.Builders
         /// <summary>
         /// Sets default queue values.
         /// </summary>
+        /// <remarks>
+        /// Every queue overflows with <c>reject-publish</c>: the broker nacks the publish and the
+        /// publisher gets a <c>PublishException</c>, instead of <c>drop-head</c> quietly destroying the
+        /// oldest message while the publisher is told the publish succeeded. The main queue also gets a
+        /// dead-letter exchange at declare time (see <c>BusFailureHandlingService</c>), so overflow, TTL
+        /// expiry and rejection all land in the dead-letter queue rather than nowhere.
+        /// </remarks>
         private void SetDefaults()
         {
             _config.MainQueue.QueueName = _queueName;
@@ -31,7 +38,7 @@ namespace RabbitSharp.Builders
             _config.MainQueue.Arguments = new Dictionary<string, object?>
             {
                 {"x-max-length", 50000},
-                {"x-overflow", "drop-head"}
+                {"x-overflow", "reject-publish"}
             };
 
             _config.RetryQueue.Arguments = new Dictionary<string, object?>
@@ -43,7 +50,7 @@ namespace RabbitSharp.Builders
             _config.DeadLetterQueue.Arguments = new Dictionary<string, object?>
             {
                 {"x-max-length", 100000},
-                {"x-overflow", "drop-head"}
+                {"x-overflow", "reject-publish"}
             };
         }
 
@@ -79,25 +86,50 @@ namespace RabbitSharp.Builders
             return this;
         }
 
-        /// <summary>Sets the routing key.</summary>
+        /// <summary>Sets the concrete routing key used when publishing.</summary>
         public BusInfrastructureBuilder WithRoutingKey(string routingKey)
         {
             _config.RoutingKey = routingKey;
             return this;
         }
 
-        /// <summary>Optimizes for high message throughput.</summary>
-        public BusInfrastructureBuilder ForHighThroughput()
+        /// <summary>
+        /// Sets the pattern the main queue is bound with, which may use the topic wildcards <c>#</c>
+        /// and <c>*</c>. Without it the binding uses the routing key as-is.
+        /// </summary>
+        public BusInfrastructureBuilder WithBindingPattern(string bindingPattern)
         {
-            _config.MainQueue.Arguments["x-max-length"] = 200000;
-            _config.MainQueue.Arguments["x-queue-mode"] = "lazy";
+            _config.BindingPattern = bindingPattern;
             return this;
         }
 
-        /// <summary>Ensures ordered message processing.</summary>
+        /// <summary>
+        /// Optimizes for high message throughput by raising the main queue's length limit.
+        /// </summary>
+        /// <remarks>
+        /// Does not set <c>x-queue-mode: lazy</c>: that argument has been deprecated and ignored since
+        /// RabbitMQ 3.12, which replaced it with per-queue message versions.
+        /// </remarks>
+        public BusInfrastructureBuilder ForHighThroughput()
+        {
+            _config.MainQueue.Arguments["x-max-length"] = 200000;
+            return this;
+        }
+
+        /// <summary>
+        /// Ensures ordered message processing: one active consumer at a time, and a main queue that
+        /// rejects publishes when full rather than dropping its own head.
+        /// </summary>
+        /// <remarks>
+        /// Ordering still only holds for the first delivery attempt. A message that fails and goes
+        /// through the retry queue is re-inserted behind messages published after it - if strict
+        /// ordering matters more than retrying, set <c>MaxDeliveryRetryAttempts = 0</c> so failures go
+        /// straight to the dead-letter queue.
+        /// </remarks>
         public BusInfrastructureBuilder ForOrderedProcessing()
         {
             _config.MainQueue.Arguments["x-single-active-consumer"] = true;
+            _config.MainQueue.Arguments["x-overflow"] = "reject-publish";
             return this;
         }
 

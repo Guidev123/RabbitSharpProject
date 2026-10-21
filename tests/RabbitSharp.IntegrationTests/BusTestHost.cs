@@ -17,10 +17,15 @@ namespace RabbitSharp.IntegrationTests
             RabbitMqContainerFixture fixture,
             string? clientProvidedName = null,
             Action<BrokerOptions>? configureBroker = null,
-            Action<BusResilienceOptions>? configureResilience = null)
+            Action<BusResilienceOptions>? configureResilience = null,
+            Action<BusMessagingOptions>? configureMessaging = null,
+            Action<IServiceCollection>? configureServices = null)
         {
             var services = new ServiceCollection();
             services.AddLogging(b => b.AddConsole().SetMinimumLevel(LogLevel.Information));
+
+            // Runs before AddRabbitSharp, so a replacement registered here wins its TryAdd.
+            configureServices?.Invoke(services);
 
             services.AddRabbitSharp(b =>
             {
@@ -28,7 +33,7 @@ namespace RabbitSharp.IntegrationTests
                 b.TryConnectMaxRetries = 3;
                 b.NetworkRecoveryIntervalInSeconds = 2;
                 configureBroker?.Invoke(b);
-            }, configureResilience);
+            }, configureResilience, configureMessaging);
 
             var provider = services.BuildServiceProvider();
             return (provider, provider.GetRequiredService<IBus>());
