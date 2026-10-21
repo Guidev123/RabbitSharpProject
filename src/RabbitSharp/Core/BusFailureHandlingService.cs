@@ -117,16 +117,7 @@ namespace RabbitSharp.Core
                 ["x-retry-count"] = retryCount
             };
 
-            // No per-message Expiration here: the delay is the fixed x-message-ttl of the retry queue
-            // this message is published to, which is what keeps one long wait from holding up the
-            // shorter ones behind it.
-            var retryProperties = new BasicProperties
-            {
-                MessageId = eventArgs.BasicProperties.MessageId,
-                Persistent = true,
-                Timestamp = eventArgs.BasicProperties.Timestamp,
-                Headers = headers
-            };
+            var retryProperties = BuildRepublishProperties(eventArgs.BasicProperties, headers);
 
             await channel.BasicPublishAsync(string.Empty, retryQueueName, true, retryProperties, eventArgs.Body, cancellationToken);
 
@@ -149,17 +140,66 @@ namespace RabbitSharp.Core
                 ["x-final-retry-count"] = retryCount
             };
 
-            var dlqProperties = new BasicProperties
-            {
-                MessageId = eventArgs.BasicProperties.MessageId,
-                Persistent = true,
-                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
-                Headers = headers
-            };
+            var dlqProperties = BuildRepublishProperties(eventArgs.BasicProperties, headers);
 
             await channel.BasicPublishAsync(string.Empty, queueName, true, dlqProperties, eventArgs.Body, cancellationToken);
 
             LogSentToDeadLetterQueue(correlationId, queueName, retryCount);
+        }
+
+        /// <summary>
+        /// The properties for a republish to the retry or dead-letter queue: everything the producer
+        /// set, with <paramref name="headers"/> replacing the original header table.
+        /// </summary>
+        /// <remarks>
+        /// Built from RabbitMQ.Client's copy constructor rather than field by field, so a property
+        /// this code does not know about is carried instead of silently dropped - which is how
+        /// <c>content-type</c>, <c>correlation-id</c>, <c>reply-to</c>, <c>type</c>, <c>app-id</c>
+        /// and <c>priority</c> used to disappear the first time a message failed, leaving a
+        /// request/reply consumer with no <c>reply-to</c> to answer and a priority queue with
+        /// everything back at priority 0.
+        /// <para>
+        /// Three properties are then overridden on purpose:
+        /// </para>
+        /// <list type="bullet">
+        /// <item>
+        /// <description>
+        /// <c>Persistent</c> is forced on. A message on the retry or dead-letter path has already
+        /// failed once; losing it to a broker restart because the producer published it transiently
+        /// is worse than the cost of writing it to disk.
+        /// </description>
+        /// </item>
+        /// <item>
+        /// <description>
+        /// <c>Expiration</c> - the per-message TTL - is cleared. On a retry queue it competes with
+        /// that queue's fixed <c>x-message-ttl</c> and the shorter of the two wins, so a producer's
+        /// TTL would cut the backoff short. On the dead-letter queue, which has no dead-letter
+        /// exchange of its own, the message would expire there and the broker would drop it.
+        /// </description>
+        /// </item>
+        /// <item>
+        /// <description>
+        /// <c>UserId</c> is cleared. The broker validates <c>user-id</c> against the authenticated
+        /// user of the publishing connection and answers a mismatch with <c>406 PRECONDITION_FAILED
+        /// - user_id property set to 'x' but authenticated user was 'y'</c> on
+        /// <c>basic.publish</c>, which closes the channel. The connection republishing here belongs
+        /// to the consumer, not the producer, so carrying it would take the subscription down on the
+        /// first failure of any message produced by another service.
+        /// </description>
+        /// </item>
+        /// </list>
+        /// </remarks>
+        internal static BasicProperties BuildRepublishProperties(
+            IReadOnlyBasicProperties source,
+            Dictionary<string, object?> headers)
+        {
+            return new BasicProperties(source)
+            {
+                Headers = headers,
+                Persistent = true,
+                Expiration = null,
+                UserId = null
+            };
         }
 
         public int GetRetryCount(IReadOnlyBasicProperties? properties)

@@ -11,10 +11,17 @@ namespace RabbitSharp.Builders
         private readonly string _queueName;
 
         /// <summary>
-        /// Initializes with the base queue name.
+        /// Initializes with the base queue name, which every other queue name is derived from.
         /// </summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="queueName"/> is <see langword="null"/>, empty or whitespace. A
+        /// blank name is not an empty name to AMQP - see
+        /// <see cref="Options.BusInfrastructureOptions.Validate"/>.
+        /// </exception>
         public BusInfrastructureBuilder(string queueName)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(queueName);
+
             _queueName = queueName;
             SetDefaults();
         }
@@ -133,12 +140,29 @@ namespace RabbitSharp.Builders
             return this;
         }
 
-        /// <summary>Configures for development environment.</summary>
+        /// <summary>
+        /// Configures for a development environment: a small main queue that is deleted after an hour
+        /// with no consumer, so a dev broker does not fill up with queues from branches nobody is
+        /// running any more.
+        /// </summary>
+        /// <remarks>
+        /// Deleting the main queue deletes the messages in it, so this is for development only - an
+        /// application that is down for over an hour comes back to an empty queue, and whatever was
+        /// published in the meantime was rejected as unroutable.
+        /// <para>
+        /// The retry queues deliberately do not expire. <c>x-expires</c> counts a queue as unused
+        /// when it has no consumers, has not been redeclared and has not been read with
+        /// <c>basic.get</c> - and publishing to it does not count. A retry queue is only ever
+        /// published to, so "unused" is its normal state even while the subscription is perfectly
+        /// healthy: it would be deleted out from under a working subscription, taking any message
+        /// waiting out its TTL with it, and every later retry would fail to route and be
+        /// dead-lettered instead of retried.
+        /// </para>
+        /// </remarks>
         public BusInfrastructureBuilder ForDevelopment()
         {
             _config.MainQueue.Arguments["x-max-length"] = 1000;
             _config.MainQueue.Arguments["x-expires"] = 3600000;
-            _config.RetryQueue.Arguments["x-expires"] = 1800000;
             return this;
         }
 

@@ -45,6 +45,14 @@ namespace RabbitSharp.Abstractions
         ConsumerCancelledByBroker,
 
         /// <summary>The subscription's channel closed with a non-success reply code.</summary>
-        ChannelShutdown
+        ChannelShutdown,
+
+        /// <summary>
+        /// A message failed and neither the retry queue nor the dead-letter queue would take it, so
+        /// the message was left on the main queue and the subscription stopped instead of spinning on
+        /// a delivery it has nowhere to put. The usual cause is a dead-letter queue at its
+        /// <c>x-max-length</c> limit, or one that was deleted.
+        /// </summary>
+        FailureHandlingUnavailable
     }
 }

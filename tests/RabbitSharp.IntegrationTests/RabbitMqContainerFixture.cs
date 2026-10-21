@@ -180,6 +180,12 @@ namespace RabbitSharp.IntegrationTests
             return response.StatusCode != HttpStatusCode.NotFound;
         }
 
+        public async Task<bool> ExchangeExistsAsync(string exchangeName)
+        {
+            var response = await ManagementClient.GetAsync($"api/exchanges/%2F/{Uri.EscapeDataString(exchangeName)}");
+            return response.StatusCode != HttpStatusCode.NotFound;
+        }
+
         /// <summary>
         /// Opens a connection to the container using the raw RabbitMQ.Client directly, independent
         /// of RabbitSharp's own connection machinery - for assertions that need to inspect broker
@@ -209,6 +215,19 @@ namespace RabbitSharp.IntegrationTests
             await using var channel = await connection.CreateChannelAsync();
 
             return await channel.MessageCountAsync(queueName);
+        }
+
+        /// <summary>
+        /// How many consumers the broker has on a queue right now, read over AMQP rather than from
+        /// the management plugin's last sample - so a test can wait for a consumer to really be gone
+        /// instead of sleeping and hoping.
+        /// </summary>
+        public async Task<uint> GetConsumerCountAsync(string queueName)
+        {
+            await using var connection = await CreateRawConnectionAsync();
+            await using var channel = await connection.CreateChannelAsync();
+
+            return await channel.ConsumerCountAsync(queueName);
         }
     }
 }

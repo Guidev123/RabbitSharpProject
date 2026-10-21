@@ -236,11 +236,18 @@ bus.SubscriptionInterrupted += args =>
 };
 ```
 
+This fires only for a subscription that will *not* come back on its own, so re-subscribing on it is
+safe. A dropped connection is not one of those cases: RabbitMQ.Client's automatic recovery
+re-registers the consumer itself, which is logged but raises no event - re-subscribing there would
+add a second consumer to the queue on every network blip.
+
 ## Environment-Specific Presets
 RabbitSharp provides pre-configured setups for different scenarios:
 
 ```csharp
-// For development environments: smaller queue, and queues that expire when unused
+// For development environments: a smaller main queue, deleted (with its messages) after an hour
+// with no consumer. The retry queues never expire - nothing consumes from them, so they would be
+// deleted while the subscription is still healthy and later retries would stop happening.
 var devOptions = new BusInfrastructureBuilder("my-queue")
     .ForDevelopment()
     .Build();
@@ -293,7 +300,9 @@ What happens to a failing delivery:
 | Handler throws, attempts exhausted | Published to the dead-letter queue with `x-final-retry-count` |
 | Body is `null`, malformed, or its properties did not bind | Dead-lettered immediately - another attempt cannot make it readable |
 | Handler succeeded but the ack failed | Logged as such and left alone: the broker redelivers it, so handlers should tolerate a redelivery. It is not retried or dead-lettered, which would duplicate work that already succeeded |
-| Retry/dead-letter publish itself fails | Nacked without requeue, so the main queue dead-letter exchange takes it instead of looping |
+| Retry publish fails (retry queue deleted or full) | Dead-lettered instead, so the failure costs the retry and not the message |
+| Any republish to the retry or dead-letter queue | Carries every property the producer set - `content-type`, `correlation-id`, `reply-to`, `type`, `app-id`, `priority`, `timestamp`, headers. `delivery-mode` is forced to persistent; `expiration` and `user-id` are dropped (see below) |
+| Dead-letter publish also fails (dead-letter queue deleted or at `x-max-length`) | Requeued on the main queue and the subscription is **stopped**, raising `SubscriptionInterrupted` with `FailureHandlingUnavailable`. Nacking it without requeue would dead-letter it into the very queue that just rejected it, and the broker discards a dead-lettered message a `reject-publish` queue refuses - so the message would be destroyed. Drain or raise the limit of the dead-letter queue, then re-subscribe |
 
 ## Upgrading an existing deployment
 
@@ -311,6 +320,30 @@ fails against it. Pick one per queue:
 The single `{queue}.retry` queue is no longer declared; the per-delay queues
 (`{queue}.retry.1000ms`, ...) take its place. Drain the old one and delete it - messages still sitting
 in it dead-letter back into the main queue as usual, but nothing publishes to it any more.
+
+A blank queue name is now rejected by `SubscribeAsync`, `BusInfrastructureBuilder` and
+`QueueBuilder.WithName` instead of being accepted. It never worked: AMQP reads a blank name in
+`queue.bind` and `basic.consume` as "the last queue declared on this channel", so such a subscription
+was silently consuming from one of its own retry queues. If this throws for you on upgrade, that
+subscription was already bound to the wrong queue.
+
+`ForDevelopment()` no longer puts `x-expires` on the retry queues, only on the main queue. Retry
+queues declared by an earlier version still carry it, and redeclaring them without it fails with
+`406 PRECONDITION_FAILED` - delete the `{queue}.retry.*ms` queues once drained and let this version
+declare them.
+
+A dead-lettered message now carries the producer's `timestamp` instead of the time it was
+dead-lettered; the time of death moved to the `x-failed-at` header, which has always been there.
+Anything reading a dead-letter queue and treating `timestamp` as "when this failed" should read
+`x-failed-at` instead.
+
+Two properties are dropped from the republish on purpose, and carrying them would be worse than
+losing them. `expiration` competes with the retry queue's own `x-message-ttl` (the shorter wins, so
+it would cut the backoff short) and would expire the message out of the dead-letter queue, which has
+no dead-letter exchange to catch it. `user-id` is validated by the broker against the authenticated
+user of the publishing connection - and the connection republishing is the consumer's, not the
+producer's - so a message from another service would answer `406 PRECONDITION_FAILED - user_id
+property set to ... but authenticated user was ...` and close the subscription's channel.
 
 ## Best Practices
 

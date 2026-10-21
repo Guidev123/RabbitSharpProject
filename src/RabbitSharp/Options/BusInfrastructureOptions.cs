@@ -41,5 +41,46 @@ namespace RabbitSharp.Options
         /// exactly that key.
         /// </summary>
         public string? BindingPattern { get; set; }
+
+        /// <summary>
+        /// Validates the queue names, which AMQP gives a meaning to that no exception would otherwise
+        /// surface.
+        /// </summary>
+        /// <remarks>
+        /// A blank queue name is not an empty name to AMQP: in <c>queue.bind</c> and
+        /// <c>basic.consume</c> it means "the last queue declared on this channel". The declares run
+        /// main queue, dead-letter queue, then one retry queue per delay, so a blank main queue name
+        /// makes the binding and the consumer silently attach to a retry queue while the queue the
+        /// subscription was meant to serve is a server-named one nothing is bound to. The
+        /// subscription comes up and consumes the wrong queue, and nothing throws.
+        /// </remarks>
+        /// <exception cref="ArgumentException">Thrown when a required queue name is missing.</exception>
+        /// <exception cref="ArgumentNullException">
+        /// Thrown when <paramref name="busResilience"/> is <see langword="null"/>.
+        /// </exception>
+        public void Validate(BusResilienceOptions busResilience)
+        {
+            ArgumentNullException.ThrowIfNull(busResilience);
+
+            if (string.IsNullOrWhiteSpace(MainQueue.QueueName))
+                throw new ArgumentException(
+                    "BusInfrastructureOptions.MainQueue.QueueName must be provided. A blank name means " +
+                    "\"the last queue declared on this channel\" to AMQP, so the binding and the consumer " +
+                    "would silently attach to one of the retry queues instead.",
+                    nameof(MainQueue));
+
+            if (string.IsNullOrWhiteSpace(DeadLetterQueue.QueueName))
+                throw new ArgumentException(
+                    "BusInfrastructureOptions.DeadLetterQueue.QueueName must be provided. It is also the " +
+                    "main queue's x-dead-letter-routing-key, so a blank name routes every dead-lettered " +
+                    "message to the default exchange with no routing key, where the broker drops it.",
+                    nameof(DeadLetterQueue));
+
+            if (busResilience.MaxDeliveryRetryAttempts > 0 && string.IsNullOrWhiteSpace(RetryQueue.QueueName))
+                throw new ArgumentException(
+                    "BusInfrastructureOptions.RetryQueue.QueueName must be provided when " +
+                    "BusResilienceOptions.MaxDeliveryRetryAttempts is greater than zero.",
+                    nameof(RetryQueue));
+        }
     }
 }

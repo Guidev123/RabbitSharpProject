@@ -17,8 +17,14 @@ namespace RabbitSharp.Builders
         }
 
         /// <summary>Sets the queue name.</summary>
+        /// <exception cref="ArgumentException">
+        /// Thrown when <paramref name="name"/> is <see langword="null"/>, empty or whitespace: a blank
+        /// queue name means "the last queue declared on this channel" to AMQP, not an unnamed queue.
+        /// </exception>
         public QueueBuilder WithName(string name)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
             _config.QueueName = name;
             return this;
         }
@@ -68,6 +74,13 @@ namespace RabbitSharp.Builders
         }
 
         /// <summary>Sets the queue expiration time.</summary>
+        /// <remarks>
+        /// Do not set this on a retry queue. <c>x-expires</c> treats a queue as unused when it has no
+        /// consumers, has not been redeclared and has not been read with <c>basic.get</c>; publishing
+        /// to it does not count. A retry queue is only ever published to, so it would be deleted while
+        /// the subscription is still healthy - taking any message waiting out its TTL with it - and
+        /// every later retry would fail to route and be dead-lettered instead of retried.
+        /// </remarks>
         /// <exception cref="ArgumentOutOfRangeException">
         /// Thrown if <paramref name="expiration"/> is negative, or exceeds ~24.8 days (int32 milliseconds).
         /// </exception>
