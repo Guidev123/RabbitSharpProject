@@ -1,6 +1,4 @@
 using Microsoft.Extensions.Logging;
-using Polly;
-using Polly.Retry;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using RabbitMQ.Client.Exceptions;
@@ -15,8 +13,6 @@ namespace RabbitSharp.Core
         private readonly ILogger<ConnectionManager> _logger;
         private readonly ConnectionFactory _connectionFactory;
         private readonly SemaphoreSlim _connectionSemaphore = new(1, 1);
-
-        private readonly ResiliencePipeline? _connectRetryPipeline;
 
         private IConnection? _connection;
         private IChannel? _publishChannel;
@@ -47,32 +43,6 @@ namespace RabbitSharp.Core
                 ConsumerDispatchConcurrency = brokerOptions.ConsumerDispatchConcurrency,
                 ClientProvidedName = brokerOptions.ClientProvidedName
             };
-
-            _connectRetryPipeline = brokerOptions.TryConnectMaxRetries > 0
-                ? BuildConnectRetryPipeline(brokerOptions)
-                : null;
-        }
-
-        private ResiliencePipeline BuildConnectRetryPipeline(BrokerOptions brokerOptions)
-        {
-            return new ResiliencePipelineBuilder()
-                .AddRetry(new RetryStrategyOptions
-                {
-                    ShouldHandle = args => new ValueTask<bool>(IsTransientConnectFailure(args.Outcome.Exception)),
-                    MaxRetryAttempts = brokerOptions.TryConnectMaxRetries,
-                    BackoffType = DelayBackoffType.Exponential,
-                    UseJitter = false,
-                    DelayGenerator = args =>
-                    {
-                        _logger.LogWarning("Attempting to connect to RabbitMQ. Retry {RetryCount}/{TryConnectMaxRetries}",
-                            args.AttemptNumber + 1, brokerOptions.TryConnectMaxRetries);
-
-                        var delay = TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber + 1));
-                        var capped = delay > brokerOptions.MaxConnectRetryDelay ? brokerOptions.MaxConnectRetryDelay : delay;
-                        return new ValueTask<TimeSpan?>(capped);
-                    }
-                })
-                .Build();
         }
 
         /// <summary>
@@ -260,15 +230,22 @@ namespace RabbitSharp.Core
             await SafeCloseAsync(_connection);
             _connection = null;
 
-            if (_connectRetryPipeline is null)
+            for (var attempt = 0; ; attempt++)
             {
-                await ConnectOnceAsync(cancellationToken);
-            }
-            else
-            {
-                await _connectRetryPipeline.ExecuteAsync(
-                    ct => new ValueTask(ConnectOnceAsync(ct)),
-                    cancellationToken);
+                try
+                {
+                    await ConnectOnceAsync(cancellationToken);
+                    return;
+                }
+                catch (Exception ex) when (attempt < _brokerOptions.TryConnectMaxRetries && IsTransientConnectFailure(ex))
+                {
+                    _logger.LogWarning("Attempting to connect to RabbitMQ. Retry {RetryCount}/{TryConnectMaxRetries}",
+                        attempt + 1, _brokerOptions.TryConnectMaxRetries);
+
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
+                    var capped = delay > _brokerOptions.MaxConnectRetryDelay ? _brokerOptions.MaxConnectRetryDelay : delay;
+                    await Task.Delay(capped, cancellationToken);
+                }
             }
         }
 

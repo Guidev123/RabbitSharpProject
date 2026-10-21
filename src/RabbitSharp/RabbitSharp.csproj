@@ -52,15 +52,8 @@
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.13" />
 	</ItemGroup>
 
-	<!--
-		Polly.Core directly, not Microsoft.Extensions.Resilience: the only thing used here is Polly's
-		ResiliencePipelineBuilder, and Resilience dragged Microsoft.Extensions.Diagnostics/Telemetry 10.x
-		into every consumer - net8 ones included - along with the version bumps needed to keep NuGet from
-		reporting a downgrade (NU1605).
-	-->
 	<!-- Common Dependencies for all frameworks -->
 	<ItemGroup>
-		<PackageReference Include="Polly.Core" Version="8.7.0" />
 		<PackageReference Include="RabbitMQ.Client" Version="7.1.2" />
 	</ItemGroup>
 

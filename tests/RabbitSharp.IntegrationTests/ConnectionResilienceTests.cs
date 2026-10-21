@@ -18,9 +18,9 @@ namespace RabbitSharp.IntegrationTests
         [Fact]
         public async Task TryConnectMaxRetriesZero_ConnectsWithoutThrowingAtStartup()
         {
-            // Polly v8's RetryStrategyOptions requires MaxRetryAttempts >= 1, unlike the classic
-            // Policy API this replaced, which accepted 0 to mean "try once, no retries". This must
-            // not surface as a ValidationException when the pipeline is built.
+            // TryConnectMaxRetries = 0 means "try once, no retries" - ReconnectAsync's retry loop
+            // must treat that as "never satisfies attempt < TryConnectMaxRetries" rather than as a
+            // misconfiguration.
             var (services, bus) = BusTestHost.Create(_fixture, configureBroker: b => b.TryConnectMaxRetries = 0);
             await using var _ = services;
             await using var __ = bus;
