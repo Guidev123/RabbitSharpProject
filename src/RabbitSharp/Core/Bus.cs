@@ -230,25 +230,34 @@ namespace RabbitSharp.Core
             catch (Exception ex)
             {
                 LogDeserializeError(ex, correlationId, queueName);
-                await HandleFailedDeliveryAsync(eventArgs, options, channel, correlationId, isPoisonPayload: true, cancellationToken);
+                // A poison payload is never retried - the bytes do not change on redelivery, so it
+                // would fail the same way every time - and it can only ever be the first attempt
+                // seeing it, which is why retryCount is 0 rather than read back from anywhere.
+                await DeadLetterAndAckOrStopSubscriptionAsync(eventArgs, options, channel, correlationId, retryCount: 0, cancellationToken);
                 return;
             }
 
             if (message is null)
             {
                 LogDeserializeFailed(correlationId, queueName);
-                await HandleFailedDeliveryAsync(eventArgs, options, channel, correlationId, isPoisonPayload: true, cancellationToken);
+                await DeadLetterAndAckOrStopSubscriptionAsync(eventArgs, options, channel, correlationId, retryCount: 0, cancellationToken);
                 return;
             }
 
             if (_busMessagingOptions.RejectMessagesWithEmptyCorrelationId && message.CorrelationId == Guid.Empty)
             {
                 LogEmptyCorrelationId(correlationId, queueName);
-                await HandleFailedDeliveryAsync(eventArgs, options, channel, correlationId, isPoisonPayload: true, cancellationToken);
+                await DeadLetterAndAckOrStopSubscriptionAsync(eventArgs, options, channel, correlationId, retryCount: 0, cancellationToken);
                 return;
             }
 
             LogReceived(typeof(T).Name, message.CorrelationId, queueName);
+
+            if (_busResilienceOptions.Strategy == RetryStrategy.InMemory)
+            {
+                await HandleDeliveryWithInMemoryRetryAsync(message, eventArgs, options, channel, onMessage, correlationId, cancellationToken);
+                return;
+            }
 
             try
             {
@@ -257,29 +266,85 @@ namespace RabbitSharp.Core
             catch (Exception ex)
             {
                 LogProcessingError(ex, correlationId, queueName);
-                await HandleFailedDeliveryAsync(eventArgs, options, channel, correlationId, isPoisonPayload: false, cancellationToken);
+                await HandleFailedDeliveryViaRetryQueueAsync(eventArgs, options, channel, correlationId, cancellationToken);
                 return;
             }
 
-            try
-            {
-                await channel.BasicAckAsync(deliveryTag, false);
-            }
-            catch (Exception ex)
-            {
-                LogAckFailed(ex, correlationId, queueName);
-                return;
-            }
-
-            LogProcessed(typeof(T).Name, message.CorrelationId, queueName);
+            await AckAndLogAsync(channel, deliveryTag, correlationId, queueName, typeof(T).Name, message.CorrelationId);
         }
 
-        private async Task HandleFailedDeliveryAsync(
+        /// <summary>
+        /// Retries a failed delivery in-process under <see cref="RetryStrategy.InMemory"/>: waits this
+        /// attempt's exponential backoff delay, then invokes the handler again on the very same
+        /// delivery, up to <see cref="BusResilienceOptions.MaxDeliveryRetryAttempts"/> times. No retry
+        /// queue is ever declared or published to; the delivery stays unacknowledged - and its
+        /// prefetch slot occupied - for the whole backoff window, acked only once the handler
+        /// succeeds and dead-lettered (with an ack) once retries are exhausted.
+        /// </summary>
+        /// <remarks>
+        /// A cancellation during the backoff delay - the subscription is stopping - nacks the delivery
+        /// with requeue instead of continuing to retry or dead-lettering it. The attempt count made so
+        /// far is not durable anywhere (there is no republish to carry an <c>x-retry-count</c> header),
+        /// so a requeued delivery is retried from attempt 0 the next time it is delivered, whether
+        /// that is to this process after a restart or to another consumer of the same queue.
+        /// </remarks>
+        private async Task HandleDeliveryWithInMemoryRetryAsync<T>(
+            T message,
+            BasicDeliverEventArgs eventArgs,
+            BusInfrastructureOptions options,
+            IChannel channel,
+            Func<T, Task> onMessage,
+            string correlationId,
+            CancellationToken cancellationToken) where T : IMessage
+        {
+            var deliveryTag = eventArgs.DeliveryTag;
+            var queueName = options.MainQueue.QueueName;
+            var attempt = 0;
+
+            while (true)
+            {
+                try
+                {
+                    await onMessage(message);
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LogProcessingError(ex, correlationId, queueName);
+
+                    if (attempt >= _busResilienceOptions.MaxDeliveryRetryAttempts)
+                    {
+                        LogRetriesExceeded(correlationId, queueName, _busResilienceOptions.MaxDeliveryRetryAttempts);
+                        await DeadLetterAndAckOrStopSubscriptionAsync(eventArgs, options, channel, correlationId, attempt, cancellationToken);
+                        return;
+                    }
+
+                    attempt++;
+                    var delayMs = _busResilienceOptions.GetRetryDelayMilliseconds(attempt);
+
+                    try
+                    {
+                        await Task.Delay(delayMs, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        LogInMemoryRetryCancelled(correlationId, queueName);
+                        await HoldBackForRedeliveryAsync(channel, deliveryTag, correlationId, queueName);
+                        return;
+                    }
+
+                    LogInMemoryRetry(correlationId, queueName, delayMs, attempt, _busResilienceOptions.MaxDeliveryRetryAttempts);
+                }
+            }
+
+            await AckAndLogAsync(channel, deliveryTag, correlationId, queueName, typeof(T).Name, message.CorrelationId);
+        }
+
+        private async Task HandleFailedDeliveryViaRetryQueueAsync(
             BasicDeliverEventArgs eventArgs,
             BusInfrastructureOptions options,
             IChannel channel,
             string correlationId,
-            bool isPoisonPayload,
             CancellationToken cancellationToken)
         {
             var deliveryTag = eventArgs.DeliveryTag;
@@ -288,7 +353,7 @@ namespace RabbitSharp.Core
 
             try
             {
-                if (!isPoisonPayload && retryCount < _busResilienceOptions.MaxDeliveryRetryAttempts)
+                if (retryCount < _busResilienceOptions.MaxDeliveryRetryAttempts)
                 {
                     try
                     {
@@ -305,7 +370,7 @@ namespace RabbitSharp.Core
                     {
                         LogRetryQueueUnavailable(retryEx, correlationId, options.RetryQueue.QueueName);
 
-                        await DeadLetterAndAckAsync(eventArgs, options, channel, correlationId, cancellationToken);
+                        await DeadLetterAndAckAsync(eventArgs, options, channel, correlationId, retryCount, cancellationToken);
                         return;
                     }
 
@@ -315,12 +380,9 @@ namespace RabbitSharp.Core
                 }
                 else
                 {
-                    if (!isPoisonPayload)
-                    {
-                        LogRetriesExceeded(correlationId, queueName, _busResilienceOptions.MaxDeliveryRetryAttempts);
-                    }
+                    LogRetriesExceeded(correlationId, queueName, _busResilienceOptions.MaxDeliveryRetryAttempts);
 
-                    await DeadLetterAndAckAsync(eventArgs, options, channel, correlationId, cancellationToken);
+                    await DeadLetterAndAckAsync(eventArgs, options, channel, correlationId, retryCount, cancellationToken);
                 }
             }
             catch (Exception handlingEx)
@@ -336,16 +398,67 @@ namespace RabbitSharp.Core
             BusInfrastructureOptions options,
             IChannel channel,
             string correlationId,
+            int retryCount,
             CancellationToken cancellationToken)
         {
             await _busFailureHandlingService.SendToDeadLetterQueueAsync(
                 eventArgs,
                 options.DeadLetterQueue.QueueName,
                 correlationId,
+                retryCount,
                 channel,
                 cancellationToken);
 
             await channel.BasicAckAsync(eventArgs.DeliveryTag, false);
+        }
+
+        /// <summary>
+        /// Dead-letters and acks the delivery, stopping the subscription instead when even that fails
+        /// - there is nowhere left to put the message. Used by every path that moves straight to the
+        /// dead-letter queue without first going through <see cref="HandleFailedDeliveryViaRetryQueueAsync"/>,
+        /// which already wraps its own dead-lettering in the same way.
+        /// </summary>
+        private async Task DeadLetterAndAckOrStopSubscriptionAsync(
+            BasicDeliverEventArgs eventArgs,
+            BusInfrastructureOptions options,
+            IChannel channel,
+            string correlationId,
+            int retryCount,
+            CancellationToken cancellationToken)
+        {
+            var queueName = options.MainQueue.QueueName;
+
+            try
+            {
+                await DeadLetterAndAckAsync(eventArgs, options, channel, correlationId, retryCount, cancellationToken);
+            }
+            catch (Exception handlingEx)
+            {
+                LogFailureHandlingError(handlingEx, correlationId, queueName);
+
+                await HoldBackAndStopSubscriptionAsync(channel, eventArgs.DeliveryTag, correlationId, queueName);
+            }
+        }
+
+        private async Task AckAndLogAsync(
+            IChannel channel,
+            ulong deliveryTag,
+            string correlationId,
+            string queueName,
+            string messageType,
+            Guid messageCorrelationId)
+        {
+            try
+            {
+                await channel.BasicAckAsync(deliveryTag, false);
+            }
+            catch (Exception ex)
+            {
+                LogAckFailed(ex, correlationId, queueName);
+                return;
+            }
+
+            LogProcessed(messageType, messageCorrelationId, queueName);
         }
 
         /// <summary>
@@ -367,6 +480,23 @@ namespace RabbitSharp.Core
             string correlationId,
             string queueName)
         {
+            await HoldBackForRedeliveryAsync(channel, deliveryTag, correlationId, queueName);
+
+            _ = Task.Run(() => StopSubscriptionAsync(channel, queueName));
+        }
+
+        /// <summary>
+        /// Nacks the delivery with requeue, without stopping the subscription. Used when the backoff
+        /// delay of <see cref="RetryStrategy.InMemory"/> is cancelled because the subscription is
+        /// already stopping on its own - cancellation already drives that shutdown elsewhere, so there
+        /// is nothing left for this call to trigger.
+        /// </summary>
+        private async Task HoldBackForRedeliveryAsync(
+            IChannel channel,
+            ulong deliveryTag,
+            string correlationId,
+            string queueName)
+        {
             try
             {
                 await channel.BasicNackAsync(deliveryTag, false, true);
@@ -375,8 +505,6 @@ namespace RabbitSharp.Core
             {
                 LogNackFailed(nackEx, correlationId, queueName);
             }
-
-            _ = Task.Run(() => StopSubscriptionAsync(channel, queueName));
         }
 
         private async Task StopSubscriptionAsync(IChannel channel, string queueName)
@@ -764,5 +892,11 @@ namespace RabbitSharp.Core
 
         [LoggerMessage(EventId = 18, Level = LogLevel.Critical, Message = "The subscription on queue {QueueName} has been stopped: a failed message could reach neither the retry queue nor the dead-letter queue, and it was left on the main queue rather than destroyed. Drain or raise the limit of the dead-letter queue, then re-subscribe")]
         private partial void LogSubscriptionStoppedWithNowhereToPutFailures(string queueName);
+
+        [LoggerMessage(EventId = 19, Level = LogLevel.Warning, Message = "Message {CorrelationId} from queue {QueueName} failed; retrying in-process after {DelayMs}ms (attempt {RetryCount}/{MaxDeliveryRetryAttempts})")]
+        private partial void LogInMemoryRetry(string correlationId, string queueName, int delayMs, int retryCount, int maxDeliveryRetryAttempts);
+
+        [LoggerMessage(EventId = 20, Level = LogLevel.Warning, Message = "The in-process retry backoff for message {CorrelationId} from queue {QueueName} was cancelled; the delivery was requeued and will be retried from attempt 0 on its next delivery")]
+        private partial void LogInMemoryRetryCancelled(string correlationId, string queueName);
     }
 }

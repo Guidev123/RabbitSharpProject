@@ -14,7 +14,11 @@ namespace RabbitSharp.UnitTests.Options
             return options;
         }
 
-        private static BusResilienceOptions Resilience(int attempts) => new() { MaxDeliveryRetryAttempts = attempts };
+        private static BusResilienceOptions Resilience(int attempts) => new()
+        {
+            MaxDeliveryRetryAttempts = attempts,
+            Strategy = RetryStrategy.RetryQueue
+        };
 
         [Fact]
         public void Validate_WithEveryNameSet_DoesNotThrow()
@@ -70,6 +74,21 @@ namespace RabbitSharp.UnitTests.Options
             options.RetryQueue.QueueName = string.Empty;
 
             options.Validate(Resilience(0));
+        }
+
+        [Fact]
+        public void Validate_WithBlankRetryQueueNameAndInMemoryStrategy_DoesNotThrow()
+        {
+            // RetryStrategy.InMemory never declares or publishes to a retry queue, regardless of how
+            // many attempts are configured, so its name is irrelevant.
+            var options = Valid();
+            options.RetryQueue.QueueName = string.Empty;
+
+            var resilience = new BusResilienceOptions { MaxDeliveryRetryAttempts = 3, Strategy = RetryStrategy.InMemory };
+
+            var exception = Record.Exception(() => options.Validate(resilience));
+
+            Assert.Null(exception);
         }
 
         [Fact]

@@ -1,6 +1,7 @@
 using RabbitMQ.Client;
 using RabbitSharp.Abstractions;
 using RabbitSharp.Builders;
+using RabbitSharp.Options;
 using System.Text.Json;
 using Xunit;
 
@@ -35,10 +36,10 @@ namespace RabbitSharp.IntegrationTests
 
             var (services, bus) = BusTestHost.Create(_fixture, configureResilience: r =>
             {
+                r.Strategy = RetryStrategy.RetryQueue;
                 r.MaxDeliveryRetryAttempts = 1;
                 // Long enough that the message is still parked in the retry queue to be inspected.
                 r.InitialDeliveryRetryDelay = TimeSpan.FromSeconds(30);
-                r.MaxDeliveryRetryDelay = TimeSpan.FromSeconds(30);
             });
 
             await using var _ = services;
@@ -57,10 +58,10 @@ namespace RabbitSharp.IntegrationTests
             await PublishWithRichPropertiesAsync("retrypropsevent", "RetryPropsEvent", message, message.CorrelationId);
 
             await Wait.UntilAsync(
-                async () => await _fixture.GetQueueDepthAsync($"{queueName}.retry.30000ms") == 1,
+                async () => await _fixture.GetQueueDepthAsync($"{queueName}.retry") == 1,
                 "the failed message is parked in the retry queue");
 
-            var retried = await GetSingleAsync($"{queueName}.retry.30000ms");
+            var retried = await GetSingleAsync($"{queueName}.retry");
 
             AssertProducerPropertiesPreserved(retried.BasicProperties, message.CorrelationId);
 

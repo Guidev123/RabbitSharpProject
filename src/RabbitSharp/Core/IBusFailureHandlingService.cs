@@ -22,8 +22,9 @@ namespace RabbitSharp.Core
         /// The bus infrastructure configuration, including exchange and queue definitions.
         /// </param>
         /// <param name="busResilience">
-        /// The retry configuration, which determines how many per-delay retry queues are declared and
-        /// what fixed <c>x-message-ttl</c> each one carries.
+        /// The retry configuration. The retry queue is only declared when <see cref="BusResilienceOptions.Strategy"/>
+        /// is <see cref="RetryStrategy.RetryQueue"/> and <see cref="BusResilienceOptions.MaxDeliveryRetryAttempts"/>
+        /// is greater than zero; under <see cref="RetryStrategy.InMemory"/> no retry queue is declared at all.
         /// </param>
         /// <param name="channel">
         /// The AMQP channel used to declare the necessary infrastructure.
@@ -50,14 +51,14 @@ namespace RabbitSharp.Core
         int GetRetryCount(IReadOnlyBasicProperties? properties);
 
         /// <summary>
-        /// Publishes a message to the retry queue that matches this attempt's backoff delay, for
-        /// reprocessing once that queue's fixed TTL expires.
+        /// Publishes a message to the retry queue, under <see cref="RetryStrategy.RetryQueue"/>, for
+        /// reprocessing once that queue's per-message TTL expires.
         /// </summary>
         /// <param name="eventArgs">
         /// The original message delivery event arguments.
         /// </param>
-        /// <param name="queueName">
-        /// The base retry queue name; the per-delay queue name is derived from it.
+        /// <param name="retryQueueName">
+        /// The retry queue's name.
         /// </param>
         /// <param name="retryCount">
         /// The number of times the message has been retried.
@@ -76,7 +77,7 @@ namespace RabbitSharp.Core
         /// </param>
         Task SendToRetryQueueAsync(
             BasicDeliverEventArgs eventArgs,
-            string queueName,
+            string retryQueueName,
             int retryCount,
             string correlationId,
             BusResilienceOptions busResilience,
@@ -95,6 +96,12 @@ namespace RabbitSharp.Core
         /// <param name="correlationId">
         /// The correlation identifier for tracking the message.
         /// </param>
+        /// <param name="retryCount">
+        /// The number of attempts made before this message was dead-lettered, recorded as
+        /// <c>x-final-retry-count</c>. Passed explicitly by the caller rather than read back from the
+        /// message's own headers, because under <see cref="RetryStrategy.InMemory"/> there is no
+        /// <c>x-retry-count</c> header to read - retries never leave the consumer that is counting them.
+        /// </param>
         /// <param name="channel">
         /// The AMQP channel used to publish the message to the dead-letter queue.
         /// </param>
@@ -105,6 +112,7 @@ namespace RabbitSharp.Core
             BasicDeliverEventArgs eventArgs,
             string queueName,
             string correlationId,
+            int retryCount,
             IChannel channel,
             CancellationToken cancellationToken);
     }

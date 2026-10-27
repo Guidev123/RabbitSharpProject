@@ -54,7 +54,7 @@ namespace RabbitSharp.Core
             await DeclareQueueAsync(channel, options.MainQueue, cancellationToken);
             await DeclareQueueAsync(channel, options.DeadLetterQueue, cancellationToken);
 
-            await DeclareRetryQueuesAsync(channel, options, busResilience, cancellationToken);
+            await DeclareRetryQueueAsync(channel, options, busResilience, cancellationToken);
 
             await channel.QueueBindAsync(
                 options.MainQueue.QueueName,
@@ -66,50 +66,53 @@ namespace RabbitSharp.Core
         }
 
         /// <summary>
-        /// Declares one retry queue per distinct backoff delay, each with a fixed <c>x-message-ttl</c>.
+        /// Declares the single retry queue used by <see cref="RetryStrategy.RetryQueue"/>, or does
+        /// nothing under <see cref="RetryStrategy.InMemory"/> or when no retries are configured.
         /// </summary>
         /// <remarks>
-        /// RabbitMQ only evaluates a per-message TTL at the head of the queue, so a single retry queue
-        /// holding mixed delays makes every message wait for the longest one in front of it - and
-        /// exponential backoff guarantees mixed delays. One queue per delay keeps each message waiting
-        /// exactly the delay configured for its attempt.
+        /// The queue itself carries no <c>x-message-ttl</c>: the delay is set per message instead (see
+        /// <see cref="SendToRetryQueueAsync"/>), so changing <see cref="BusResilienceOptions.InitialDeliveryRetryDelay"/>
+        /// between deployments never redeclares this queue with a different fixed argument - which
+        /// RabbitMQ would reject with <c>406 PRECONDITION_FAILED</c>. Every message published here
+        /// carries the same delay, so the queue's FIFO order already matches expiry order and nothing
+        /// is lost by collapsing what used to be one queue per distinct backoff delay into one.
         /// </remarks>
-        private static async Task DeclareRetryQueuesAsync(
+        private static async Task DeclareRetryQueueAsync(
             IChannel channel,
             BusInfrastructureOptions options,
             BusResilienceOptions busResilience,
             CancellationToken cancellationToken)
         {
-            foreach (var delayMs in GetRetryDelaysMilliseconds(busResilience))
+            if (busResilience.Strategy != RetryStrategy.RetryQueue || busResilience.MaxDeliveryRetryAttempts == 0)
             {
-                var retryArguments = new Dictionary<string, object?>(options.RetryQueue.Arguments)
-                {
-                    ["x-message-ttl"] = delayMs,
-                    [DeadLetterExchangeArgument] = string.Empty,
-                    [DeadLetterRoutingKeyArgument] = options.MainQueue.QueueName
-                };
-
-                await channel.QueueDeclareAsync(
-                    GetRetryQueueName(options.RetryQueue.QueueName, delayMs),
-                    options.RetryQueue.Durable,
-                    options.RetryQueue.Exclusive,
-                    options.RetryQueue.AutoDelete,
-                    retryArguments,
-                    cancellationToken: cancellationToken);
+                return;
             }
+
+            var retryArguments = new Dictionary<string, object?>(options.RetryQueue.Arguments)
+            {
+                [DeadLetterExchangeArgument] = string.Empty,
+                [DeadLetterRoutingKeyArgument] = options.MainQueue.QueueName
+            };
+
+            await channel.QueueDeclareAsync(
+                options.RetryQueue.QueueName,
+                options.RetryQueue.Durable,
+                options.RetryQueue.Exclusive,
+                options.RetryQueue.AutoDelete,
+                retryArguments,
+                cancellationToken: cancellationToken);
         }
 
         public async Task SendToRetryQueueAsync(
                BasicDeliverEventArgs eventArgs,
-               string queueName,
+               string retryQueueName,
                int retryCount,
                string correlationId,
                BusResilienceOptions busResilience,
                IChannel channel,
                CancellationToken cancellationToken)
         {
-            var delayMs = GetRetryDelayMilliseconds(retryCount, busResilience);
-            var retryQueueName = GetRetryQueueName(queueName, delayMs);
+            var delayMs = (int)busResilience.InitialDeliveryRetryDelay.TotalMilliseconds;
 
             var originalHeaders = eventArgs.BasicProperties.Headers ?? new Dictionary<string, object?>();
             var headers = new Dictionary<string, object?>(originalHeaders)
@@ -117,22 +120,22 @@ namespace RabbitSharp.Core
                 ["x-retry-count"] = retryCount
             };
 
-            var retryProperties = BuildRepublishProperties(eventArgs.BasicProperties, headers);
+            var retryProperties = BuildRepublishProperties(eventArgs.BasicProperties, headers, delayMs);
 
             await channel.BasicPublishAsync(string.Empty, retryQueueName, true, retryProperties, eventArgs.Body, cancellationToken);
 
-            LogSentToRetryQueue(correlationId, retryQueueName, delayMs, busResilience.MaxDeliveryRetryDelay.TotalMilliseconds, retryCount);
+            LogSentToRetryQueue(correlationId, retryQueueName, delayMs, retryCount);
         }
 
         public async Task SendToDeadLetterQueueAsync(
             BasicDeliverEventArgs eventArgs,
             string queueName,
             string correlationId,
+            int retryCount,
             IChannel channel,
             CancellationToken cancellationToken)
         {
             var originalHeaders = eventArgs.BasicProperties.Headers ?? new Dictionary<string, object?>();
-            var retryCount = GetRetryCount(eventArgs.BasicProperties);
             var headers = new Dictionary<string, object?>(originalHeaders)
             {
                 ["x-original-queue"] = queueName.Replace(".deadletter", string.Empty),
@@ -171,10 +174,13 @@ namespace RabbitSharp.Core
         /// </item>
         /// <item>
         /// <description>
-        /// <c>Expiration</c> - the per-message TTL - is cleared. On a retry queue it competes with
-        /// that queue's fixed <c>x-message-ttl</c> and the shorter of the two wins, so a producer's
-        /// TTL would cut the backoff short. On the dead-letter queue, which has no dead-letter
-        /// exchange of its own, the message would expire there and the broker would drop it.
+        /// <c>Expiration</c> - the per-message TTL - is set to <paramref name="expirationMs"/> when
+        /// given (a publish to the retry queue, which carries the whole backoff delay this way instead
+        /// of as a fixed queue argument - see <see cref="DeclareRetryQueueAsync"/>), and cleared
+        /// otherwise. A producer's own TTL is never carried through: on the retry queue it would
+        /// compete with the delay this code sets, and on the dead-letter queue, which has no
+        /// dead-letter exchange of its own, it would expire the message there and the broker would
+        /// drop it.
         /// </description>
         /// </item>
         /// <item>
@@ -191,13 +197,14 @@ namespace RabbitSharp.Core
         /// </remarks>
         internal static BasicProperties BuildRepublishProperties(
             IReadOnlyBasicProperties source,
-            Dictionary<string, object?> headers)
+            Dictionary<string, object?> headers,
+            int? expirationMs = null)
         {
             return new BasicProperties(source)
             {
                 Headers = headers,
                 Persistent = true,
-                Expiration = null,
+                Expiration = expirationMs?.ToString(),
                 UserId = null
             };
         }
@@ -228,47 +235,6 @@ namespace RabbitSharp.Core
             }
         }
 
-        /// <summary>
-        /// The backoff delay, in milliseconds, for the given 1-based attempt number.
-        /// </summary>
-        internal static int GetRetryDelayMilliseconds(int retryCount, BusResilienceOptions busResilience)
-        {
-            var baseDelayMs = busResilience.InitialDeliveryRetryDelay.TotalMilliseconds;
-            var exponentialDelayMs = baseDelayMs * Math.Pow(2, Math.Max(retryCount - 1, 0));
-
-            var maxDelayMs = busResilience.MaxDeliveryRetryDelay.TotalMilliseconds;
-            return (int)Math.Min(exponentialDelayMs, maxDelayMs);
-        }
-
-        /// <summary>
-        /// The distinct delays the configured retry schedule can produce, in ascending order - one
-        /// retry queue is declared per entry.
-        /// </summary>
-        internal static IReadOnlyList<int> GetRetryDelaysMilliseconds(BusResilienceOptions busResilience)
-        {
-            var delays = new List<int>();
-
-            for (var attempt = 1; attempt <= busResilience.MaxDeliveryRetryAttempts; attempt++)
-            {
-                var delayMs = GetRetryDelayMilliseconds(attempt, busResilience);
-
-                if (delays.Count == 0 || delays[^1] != delayMs)
-                {
-                    delays.Add(delayMs);
-                }
-            }
-
-            return delays;
-        }
-
-        /// <summary>
-        /// The name of the retry queue whose fixed TTL is <paramref name="delayMs"/>.
-        /// </summary>
-        internal static string GetRetryQueueName(string baseQueueName, int delayMs)
-        {
-            return $"{baseQueueName}.{delayMs}ms";
-        }
-
         private static bool TryParseUtf8Int(byte[] bytes, out int value)
         {
             return int.TryParse(Encoding.UTF8.GetString(bytes), out value);
@@ -288,8 +254,8 @@ namespace RabbitSharp.Core
         [LoggerMessage(EventId = 101, Level = LogLevel.Information, Message = "Infrastructure declared for {QueueName} with custom options")]
         private partial void LogInfrastructureDeclared(string queueName);
 
-        [LoggerMessage(EventId = 102, Level = LogLevel.Information, Message = "Message {CorrelationId} sent to retry queue {RetryQueueName} with delay {DelayMs}ms (max: {MaxDelayMs}ms). Retry count: {RetryCount}")]
-        private partial void LogSentToRetryQueue(string correlationId, string retryQueueName, int delayMs, double maxDelayMs, int retryCount);
+        [LoggerMessage(EventId = 102, Level = LogLevel.Information, Message = "Message {CorrelationId} sent to retry queue {RetryQueueName} with delay {DelayMs}ms. Retry count: {RetryCount}")]
+        private partial void LogSentToRetryQueue(string correlationId, string retryQueueName, int delayMs, int retryCount);
 
         [LoggerMessage(EventId = 103, Level = LogLevel.Error, Message = "Message {CorrelationId} sent to dead letter queue {DeadLetterQueueName} after {RetryCount} failed attempts")]
         private partial void LogSentToDeadLetterQueue(string correlationId, string deadLetterQueueName, int retryCount);

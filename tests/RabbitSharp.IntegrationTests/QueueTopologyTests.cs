@@ -1,4 +1,5 @@
 using RabbitSharp.Abstractions;
+using RabbitSharp.Options;
 using Xunit;
 
 namespace RabbitSharp.IntegrationTests
@@ -49,9 +50,9 @@ namespace RabbitSharp.IntegrationTests
         }
 
         [Fact]
-        public async Task RetryQueues_OnePerBackoffDelay_EachWithItsOwnFixedTtl()
+        public async Task DefaultStrategy_InMemory_DeclaresNoRetryQueueAtAll()
         {
-            const string queueName = "topology.retry.queue";
+            const string queueName = "topology.inmemory.queue";
 
             var (services, bus) = BusTestHost.Create(_fixture, configureResilience: r =>
             {
@@ -65,18 +66,37 @@ namespace RabbitSharp.IntegrationTests
 
             await bus.SubscribeAsync<TopologyEvent>(queueName, _ => Task.CompletedTask);
 
-            // 500ms, 1000ms, 2000ms - one queue each, so a long wait cannot hold up a short one behind
-            // it (RabbitMQ only evaluates a per-message TTL at the head of the queue).
-            foreach (var delayMs in new[] { 500, 1000, 2000 })
-            {
-                var retryQueueName = $"{queueName}.retry.{delayMs}ms";
-                var arguments = await _fixture.GetQueueArgumentsAsync(retryQueueName);
+            Assert.False(
+                await _fixture.QueueExistsAsync($"{queueName}.retry"),
+                "RetryStrategy.InMemory, the default, must not declare a retry queue.");
+        }
 
-                Assert.True(arguments.Count > 0, $"Expected retry queue {retryQueueName} to exist.");
-                Assert.Equal(delayMs.ToString(), arguments["x-message-ttl"]);
-                Assert.Equal(string.Empty, arguments["x-dead-letter-exchange"]);
-                Assert.Equal(queueName, arguments["x-dead-letter-routing-key"]);
-            }
+        [Fact]
+        public async Task RetryQueueStrategy_DeclaresASingleRetryQueueWithNoFixedTtl()
+        {
+            const string queueName = "topology.retry.queue";
+
+            var (services, bus) = BusTestHost.Create(_fixture, configureResilience: r =>
+            {
+                r.Strategy = RetryStrategy.RetryQueue;
+                r.MaxDeliveryRetryAttempts = 3;
+                r.InitialDeliveryRetryDelay = TimeSpan.FromMilliseconds(500);
+            });
+
+            await using var _ = services;
+            await using var __ = bus;
+
+            await bus.SubscribeAsync<TopologyEvent>(queueName, _ => Task.CompletedTask);
+
+            var retryQueueName = $"{queueName}.retry";
+            var arguments = await _fixture.GetQueueArgumentsAsync(retryQueueName);
+
+            Assert.True(arguments.Count > 0, $"Expected retry queue {retryQueueName} to exist.");
+            // No fixed x-message-ttl: the delay is carried per message instead, so the delay can
+            // change between deployments without a 406 PRECONDITION_FAILED on redeclare.
+            Assert.False(arguments.ContainsKey("x-message-ttl"));
+            Assert.Equal(string.Empty, arguments["x-dead-letter-exchange"]);
+            Assert.Equal(queueName, arguments["x-dead-letter-routing-key"]);
         }
     }
 }

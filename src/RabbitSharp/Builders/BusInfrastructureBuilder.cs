@@ -128,10 +128,12 @@ namespace RabbitSharp.Builders
         /// rejects publishes when full rather than dropping its own head.
         /// </summary>
         /// <remarks>
-        /// Ordering still only holds for the first delivery attempt. A message that fails and goes
-        /// through the retry queue is re-inserted behind messages published after it - if strict
-        /// ordering matters more than retrying, set <c>MaxDeliveryRetryAttempts = 0</c> so failures go
-        /// straight to the dead-letter queue.
+        /// Ordering only holds fully under <see cref="BusResilienceOptions.Strategy"/>
+        /// <see cref="RetryStrategy.InMemory"/> (the default), where a failed message is retried in
+        /// place and later messages simply wait behind it. Under <see cref="RetryStrategy.RetryQueue"/>
+        /// a failed message is republished and re-inserted behind messages published after it - if
+        /// strict ordering matters more than retrying there, set <c>MaxDeliveryRetryAttempts = 0</c>
+        /// so failures go straight to the dead-letter queue instead.
         /// </remarks>
         public BusInfrastructureBuilder ForOrderedProcessing()
         {
@@ -150,13 +152,13 @@ namespace RabbitSharp.Builders
         /// application that is down for over an hour comes back to an empty queue, and whatever was
         /// published in the meantime was rejected as unroutable.
         /// <para>
-        /// The retry queues deliberately do not expire. <c>x-expires</c> counts a queue as unused
-        /// when it has no consumers, has not been redeclared and has not been read with
-        /// <c>basic.get</c> - and publishing to it does not count. A retry queue is only ever
-        /// published to, so "unused" is its normal state even while the subscription is perfectly
-        /// healthy: it would be deleted out from under a working subscription, taking any message
-        /// waiting out its TTL with it, and every later retry would fail to route and be
-        /// dead-lettered instead of retried.
+        /// The retry queue (declared only under <see cref="RetryStrategy.RetryQueue"/>) deliberately
+        /// does not expire. <c>x-expires</c> counts a queue as unused when it has no consumers, has
+        /// not been redeclared and has not been read with <c>basic.get</c> - and publishing to it does
+        /// not count. The retry queue is only ever published to, so "unused" is its normal state even
+        /// while the subscription is perfectly healthy: it would be deleted out from under a working
+        /// subscription, taking any message waiting out its TTL with it, and every later retry would
+        /// fail to route and be dead-lettered instead of retried.
         /// </para>
         /// </remarks>
         public BusInfrastructureBuilder ForDevelopment()

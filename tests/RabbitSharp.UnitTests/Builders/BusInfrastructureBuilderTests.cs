@@ -1,5 +1,4 @@
 using RabbitSharp.Builders;
-using RabbitSharp.Core;
 using RabbitSharp.Options;
 using Xunit;
 
@@ -44,34 +43,6 @@ namespace RabbitSharp.UnitTests.Builders
             Assert.True(options.MainQueue.Arguments.ContainsKey("x-expires"));
             Assert.False(options.RetryQueue.Arguments.ContainsKey("x-expires"));
             Assert.False(options.DeadLetterQueue.Arguments.ContainsKey("x-expires"));
-        }
-
-        /// <summary>
-        /// The per-delay retry queues are declared from the retry queue template, so an x-expires on
-        /// the template reaches every one of them.
-        /// </summary>
-        [Fact]
-        public void ForDevelopment_RetryQueueArgumentsCarryNoExpiryIntoTheDeclaredQueues()
-        {
-            var options = new BusInfrastructureBuilder("orders").ForDevelopment().Build();
-            var resilience = new BusResilienceOptions
-            {
-                MaxDeliveryRetryAttempts = 3,
-                InitialDeliveryRetryDelay = TimeSpan.FromSeconds(1),
-                MaxDeliveryRetryDelay = TimeSpan.FromMinutes(5)
-            };
-
-            foreach (var delayMs in BusFailureHandlingService.GetRetryDelaysMilliseconds(resilience))
-            {
-                var declared = new Dictionary<string, object?>(options.RetryQueue.Arguments)
-                {
-                    ["x-message-ttl"] = delayMs
-                };
-
-                Assert.False(
-                    declared.ContainsKey("x-expires"),
-                    $"The retry queue for {delayMs}ms would be declared with an expiry.");
-            }
         }
 
         [Fact]

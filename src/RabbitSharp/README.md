@@ -7,7 +7,8 @@ A highly customizable RabbitMQ Pub/Sub library for .NET 8+ applications with bui
 - ✅ Full Pub/Sub pattern implementation
 - ✅ Targets .NET 8, .NET 9 and .NET 10
 - ✅ Highly customizable configuration
-- ✅ Built-in retry mechanisms with exponential backoff, one retry queue per delay
+- ✅ Built-in retry mechanisms with exponential backoff - in-process by default, or through a single
+  physical retry queue
 - ✅ Dead letter queue support, including a dead-letter exchange on the main queue
 - ✅ Fail-loud defaults: a full queue rejects the publish instead of discarding messages
 - ✅ Network recovery and connection resilience, with a fail-fast window while the broker is down
@@ -71,6 +72,9 @@ builder.Services.AddRabbitSharp(options =>
     busResilienceOptions.InitialDeliveryRetryDelay = TimeSpan.FromSeconds(1);
     busResilienceOptions.MaxDeliveryRetryDelay = TimeSpan.FromSeconds(10);
     busResilienceOptions.MaxDeliveryRetryAttempts = 3;
+
+    // Default is RetryStrategy.InMemory - see "Retry Strategies" below.
+    busResilienceOptions.Strategy = RetryStrategy.InMemory;
 });
 ```
 
@@ -246,8 +250,9 @@ RabbitSharp provides pre-configured setups for different scenarios:
 
 ```csharp
 // For development environments: a smaller main queue, deleted (with its messages) after an hour
-// with no consumer. The retry queues never expire - nothing consumes from them, so they would be
-// deleted while the subscription is still healthy and later retries would stop happening.
+// with no consumer. The retry queue (only declared under RetryStrategy.RetryQueue) never expires -
+// nothing consumes from it, so it would be deleted while the subscription is still healthy and
+// later retries would stop happening.
 var devOptions = new BusInfrastructureBuilder("my-queue")
     .ForDevelopment()
     .Build();
@@ -263,10 +268,11 @@ var orderedOptions = new BusInfrastructureBuilder("my-queue")
     .Build();
 ```
 
-`ForOrderedProcessing()` guarantees one active consumer, which preserves order on first delivery. It
-does not preserve order across failures: a message that fails goes to the retry queue and comes back
-behind messages published after it. Set `MaxDeliveryRetryAttempts = 0` if strict ordering matters more
-than retrying.
+`ForOrderedProcessing()` guarantees one active consumer, which preserves order on first delivery. With
+the default `RetryStrategy.InMemory` it also preserves order across failures, because a failed message
+is retried in place rather than moved anywhere. Under `RetryStrategy.RetryQueue` a failed message is
+republished and comes back behind messages published after it; set `MaxDeliveryRetryAttempts = 0` if
+strict ordering matters more than retrying there.
 
 ## Exchange Types
 RabbitSharp supports the following exchange types:
@@ -280,27 +286,54 @@ both use `BusMessagingOptions.DefaultExchangeType`. Declaring the same exchange 
 types is rejected by the broker with 406 PRECONDITION_FAILED, so change that single setting rather
 than mixing a Fanout subscription with a convention-based publish.
 
+## Retry Strategies
+
+`BusResilienceOptions.Strategy` picks how a failed delivery is retried. Both share the same
+`MaxDeliveryRetryAttempts`/`InitialDeliveryRetryDelay`/`MaxDeliveryRetryDelay` knobs, but behave very
+differently operationally:
+
+| | `RetryStrategy.InMemory` (default) | `RetryStrategy.RetryQueue` |
+| --- | --- | --- |
+| Broker topology per subscription | Main queue + dead-letter queue. No retry queue at all | Main queue + dead-letter queue + **one** retry queue |
+| Backoff | Exponential, up to `MaxDeliveryRetryDelay` | Constant, equal to `InitialDeliveryRetryDelay` |
+| While waiting to retry | The delivery stays unacknowledged in the handler, holding a prefetch slot | The delivery is acked; a republish with a per-message TTL sits in the retry queue |
+| Across a process restart / subscription cancellation | Retry progress is lost - a redelivered message retries from attempt 0 | Retry progress survives - the retry queue still holds it |
+| Ordering under `ForOrderedProcessing()` | Preserved across failures too | Only preserved for the first delivery attempt |
+
+In-memory retry holds the delivery open for the whole backoff window, so `Validate()` rejects a
+configuration whose worst-case total backoff (every attempt at its capped delay, summed) exceeds
+`MaxInMemoryRetryWindow` (15 minutes by default) - comfortably under RabbitMQ's own `consumer_timeout`
+(30 minutes by default), which would otherwise close the channel out from under a delivery that has
+been unacknowledged for too long. Pick `RetryStrategy.RetryQueue` instead for backoffs that need to run
+longer than that, or raise `MaxInMemoryRetryWindow` alongside the broker's `consumer_timeout`.
+
+```csharp
+busResilienceOptions.Strategy = RetryStrategy.RetryQueue;
+```
+
 ## Failure Handling
 
 Per subscription, RabbitSharp declares:
 
 - the main queue, with a dead-letter exchange pointing at the dead-letter queue, so overflow, TTL
   expiry and rejections end up there instead of disappearing
-- one retry queue per distinct backoff delay (`{queue}.retry.1000ms`, `{queue}.retry.2000ms`, ...),
-  each with a fixed `x-message-ttl` that dead-letters back into the main queue. One queue per delay is
-  what keeps a long wait from holding up the shorter ones behind it, since RabbitMQ only evaluates a
-  per-message TTL at the head of the queue
+- the retry queue (`{queue}.retry` by default) - only under `RetryStrategy.RetryQueue`, and only when
+  `MaxDeliveryRetryAttempts > 0`. It carries no fixed TTL of its own; the delay is set per message
+  instead (see below), so changing `InitialDeliveryRetryDelay` between deployments never redeclares
+  this queue with a different argument
 - the dead-letter queue
 
 What happens to a failing delivery:
 
 | Situation | Outcome |
 | --- | --- |
-| Handler throws, attempts left | Published to the retry queue for this attempt, then redelivered |
+| Handler throws, attempts left (`InMemory`) | The delivery stays unacknowledged while this attempt's backoff delay elapses, then the handler runs again on the same delivery |
+| Handler throws, attempts left (`RetryQueue`) | Acked, and published to the retry queue with a per-message TTL equal to `InitialDeliveryRetryDelay`; redelivered once it dead-letters back to the main queue |
 | Handler throws, attempts exhausted | Published to the dead-letter queue with `x-final-retry-count` |
-| Body is `null`, malformed, or its properties did not bind | Dead-lettered immediately - another attempt cannot make it readable |
+| Body is `null`, malformed, or its properties did not bind | Dead-lettered immediately with `x-final-retry-count: 0` - another attempt cannot make it readable |
 | Handler succeeded but the ack failed | Logged as such and left alone: the broker redelivers it, so handlers should tolerate a redelivery. It is not retried or dead-lettered, which would duplicate work that already succeeded |
-| Retry publish fails (retry queue deleted or full) | Dead-lettered instead, so the failure costs the retry and not the message |
+| `InMemory`: the subscription is cancelled (or the bus disposed) while a delivery is waiting out its backoff | The delivery is nacked with requeue; it is retried from attempt 0 on its next delivery, since no attempt count was ever published anywhere |
+| `RetryQueue`: retry publish fails (retry queue deleted or full) | Dead-lettered instead, so the failure costs the retry and not the message |
 | Any republish to the retry or dead-letter queue | Carries every property the producer set - `content-type`, `correlation-id`, `reply-to`, `type`, `app-id`, `priority`, `timestamp`, headers. `delivery-mode` is forced to persistent; `expiration` and `user-id` are dropped (see below) |
 | Dead-letter publish also fails (dead-letter queue deleted or at `x-max-length`) | Requeued on the main queue and the subscription is **stopped**, raising `SubscriptionInterrupted` with `FailureHandlingUnavailable`. Nacking it without requeue would dead-letter it into the very queue that just rejected it, and the broker discards a dead-lettered message a `reject-publish` queue refuses - so the message would be destroyed. Drain or raise the limit of the dead-letter queue, then re-subscribe |
 
@@ -317,9 +350,18 @@ fails against it. Pick one per queue:
   `WithMainQueue(q => q.WithDeadLetterExchange(...))` - an explicitly configured dead-letter exchange
   is never overridden
 
-The single `{queue}.retry` queue is no longer declared; the per-delay queues
-(`{queue}.retry.1000ms`, ...) take its place. Drain the old one and delete it - messages still sitting
-in it dead-letter back into the main queue as usual, but nothing publishes to it any more.
+**`BusResilienceOptions.Strategy` now defaults to `RetryStrategy.InMemory` instead of always using a
+retry queue.** This changes the broker topology: no retry queue is declared by default any more. The
+per-delay queues an earlier version declared (`{queue}.retry.1000ms`, `{queue}.retry.2000ms`, ...) are
+simply no longer published to and drain themselves as their messages dead-letter back to the main
+queue in the normal course of things; delete them once drained. If retry progress surviving a restart,
+or the delivery not sitting unacknowledged through its backoff, matters more to you than the simpler
+topology, set `busResilienceOptions.Strategy = RetryStrategy.RetryQueue` to keep the previous behavior
+- it now declares a **single** `{queue}.retry` queue rather than one per delay, with a constant delay
+  equal to `InitialDeliveryRetryDelay` instead of the previous exponential backoff (a single queue
+  cannot hold a growing delay without a later, shorter wait queuing up behind an earlier, longer one -
+  RabbitMQ only evaluates a queue's head for expiry). Drain and delete the old per-delay queues either
+  way; this version never declares or reads from them again.
 
 A blank queue name is now rejected by `SubscribeAsync`, `BusInfrastructureBuilder` and
 `QueueBuilder.WithName` instead of being accepted. It never worked: AMQP reads a blank name in
@@ -327,10 +369,10 @@ A blank queue name is now rejected by `SubscribeAsync`, `BusInfrastructureBuilde
 was silently consuming from one of its own retry queues. If this throws for you on upgrade, that
 subscription was already bound to the wrong queue.
 
-`ForDevelopment()` no longer puts `x-expires` on the retry queues, only on the main queue. Retry
-queues declared by an earlier version still carry it, and redeclaring them without it fails with
-`406 PRECONDITION_FAILED` - delete the `{queue}.retry.*ms` queues once drained and let this version
-declare them.
+`ForDevelopment()` no longer puts `x-expires` on the retry queue, only on the main queue. A retry
+queue declared by an earlier version still carries it, and redeclaring it without that argument fails
+with `406 PRECONDITION_FAILED` - delete the old retry queue(s) once drained and let this version
+declare a fresh one.
 
 A dead-lettered message now carries the producer's `timestamp` instead of the time it was
 dead-lettered; the time of death moved to the `x-failed-at` header, which has always been there.
@@ -338,20 +380,23 @@ Anything reading a dead-letter queue and treating `timestamp` as "when this fail
 `x-failed-at` instead.
 
 Two properties are dropped from the republish on purpose, and carrying them would be worse than
-losing them. `expiration` competes with the retry queue's own `x-message-ttl` (the shorter wins, so
-it would cut the backoff short) and would expire the message out of the dead-letter queue, which has
-no dead-letter exchange to catch it. `user-id` is validated by the broker against the authenticated
-user of the publishing connection - and the connection republishing is the consumer's, not the
-producer's - so a message from another service would answer `406 PRECONDITION_FAILED - user_id
-property set to ... but authenticated user was ...` and close the subscription's channel.
+losing them. `expiration` is cleared for a dead-letter publish, since the dead-letter queue has no
+dead-letter exchange of its own to catch a message that expired out of it; for a `RetryStrategy.RetryQueue`
+republish it instead carries the configured delay on purpose, which is how that strategy avoids a
+fixed `x-message-ttl` queue argument that could never change without a `406 PRECONDITION_FAILED` on
+redeclare. `user-id` is validated by the broker against the authenticated user of the publishing
+connection - and the connection republishing is the consumer's, not the producer's - so a message
+from another service would answer `406 PRECONDITION_FAILED - user_id property set to ... but
+authenticated user was ...` and close the subscription's channel.
 
 ## Best Practices
 
 - RabbitSharp comes with defaults that fail loudly: every queue it declares overflows with
   `reject-publish`, so a full queue surfaces as a `PublishException` instead of quietly dropping the
   oldest message while the publisher is told the publish succeeded
-- Retry queues and dead letter queues are declared for you per subscription, and the main queue gets a
-  dead-letter exchange so broker-side discards are captured too
+- Dead letter queues are declared for you per subscription, and the main queue gets a dead-letter
+  exchange so broker-side discards are captured too. A retry queue is also declared, but only under
+  `RetryStrategy.RetryQueue` - the default `RetryStrategy.InMemory` declares none
 - A publish issued while the connection is down waits up to `AutomaticRecoveryWaitTimeout` (30 s by
   default). Lower it, or lower `RecoveryFailFastWindow`, for request-path publishes that must fail fast
 - Wrong credentials and a missing virtual host are not retried: they fail immediately instead of

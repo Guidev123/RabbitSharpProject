@@ -1,4 +1,5 @@
 using RabbitSharp.Abstractions;
+using RabbitSharp.Options;
 using System.Collections.Concurrent;
 using Xunit;
 
@@ -20,9 +21,9 @@ namespace RabbitSharp.IntegrationTests
         {
             var (services, bus) = BusTestHost.Create(_fixture, configureResilience: r =>
             {
+                r.Strategy = RetryStrategy.RetryQueue;
                 r.MaxDeliveryRetryAttempts = 1;
                 r.InitialDeliveryRetryDelay = TimeSpan.FromMilliseconds(200);
-                r.MaxDeliveryRetryDelay = TimeSpan.FromSeconds(1);
             });
 
             await using var _ = services;
@@ -62,9 +63,9 @@ namespace RabbitSharp.IntegrationTests
         {
             var (services, bus) = BusTestHost.Create(_fixture, configureResilience: r =>
             {
+                r.Strategy = RetryStrategy.RetryQueue;
                 r.MaxDeliveryRetryAttempts = 1;
                 r.InitialDeliveryRetryDelay = TimeSpan.FromMilliseconds(200);
-                r.MaxDeliveryRetryDelay = TimeSpan.FromSeconds(1);
             });
 
             await using var _ = services;

@@ -1,5 +1,6 @@
 using RabbitSharp.Abstractions;
 using RabbitSharp.Builders;
+using RabbitSharp.Options;
 using Xunit;
 
 namespace RabbitSharp.IntegrationTests
@@ -28,15 +29,15 @@ namespace RabbitSharp.IntegrationTests
         private sealed record DevPresetRetryEvent(Guid CorrelationId) : IMessage;
 
         [Fact]
-        public async Task ForDevelopment_ExpiresTheMainQueueButNeverTheRetryQueues()
+        public async Task ForDevelopment_ExpiresTheMainQueueButNeverTheRetryQueue()
         {
             const string queueName = "devpreset.queue";
 
             var (services, bus) = BusTestHost.Create(_fixture, configureResilience: r =>
             {
+                r.Strategy = RetryStrategy.RetryQueue;
                 r.MaxDeliveryRetryAttempts = 2;
                 r.InitialDeliveryRetryDelay = TimeSpan.FromSeconds(1);
-                r.MaxDeliveryRetryDelay = TimeSpan.FromMinutes(5);
             });
 
             await using var _ = services;
@@ -55,19 +56,17 @@ namespace RabbitSharp.IntegrationTests
             var mainArguments = await _fixture.GetQueueArgumentsAsync(queueName);
             Assert.True(mainArguments.ContainsKey("x-expires"), "the main queue should still expire when unused.");
 
-            // The regression: every retry queue was declared with the same x-expires, so the retry
-            // path quietly deleted itself after half an hour of a healthy, idle subscription.
-            foreach (var delayMs in new[] { 1000, 2000 })
-            {
-                var retryQueueName = $"{queueName}.retry.{delayMs}ms";
-                var retryArguments = await _fixture.GetQueueArgumentsAsync(retryQueueName);
+            // The regression this guards against: the retry queue was declared with the same
+            // x-expires, so the retry path quietly deleted itself after half an hour of a healthy,
+            // idle subscription.
+            var retryQueueName = $"{queueName}.retry";
+            var retryArguments = await _fixture.GetQueueArgumentsAsync(retryQueueName);
 
-                Assert.True(retryArguments.Count > 0, $"Expected retry queue {retryQueueName} to exist.");
-                Assert.False(
-                    retryArguments.ContainsKey("x-expires"),
-                    $"Retry queue {retryQueueName} must not expire: nothing ever consumes from it or " +
-                    $"redeclares it, so it would be deleted while the subscription is still healthy.");
-            }
+            Assert.True(retryArguments.Count > 0, $"Expected retry queue {retryQueueName} to exist.");
+            Assert.False(
+                retryArguments.ContainsKey("x-expires"),
+                $"Retry queue {retryQueueName} must not expire: nothing ever consumes from it or " +
+                $"redeclares it, so it would be deleted while the subscription is still healthy.");
         }
 
         [Fact]

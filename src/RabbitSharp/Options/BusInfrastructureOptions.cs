@@ -17,9 +17,9 @@ namespace RabbitSharp.Options
         public QueueOptions MainQueue { get; set; } = new();
 
         /// <summary>
-        /// Gets or sets the retry queue configuration. Its name is the base name of the per-delay
-        /// retry queues the library declares (<c>{name}.1000ms</c>, <c>{name}.2000ms</c>, ...), one per
-        /// distinct backoff delay, each with a fixed <c>x-message-ttl</c>.
+        /// Gets or sets the retry queue configuration. Only declared, and only used, when
+        /// <see cref="BusResilienceOptions.Strategy"/> is <see cref="RetryStrategy.RetryQueue"/> - see
+        /// its remarks for why it is a single physical queue rather than one per backoff delay.
         /// </summary>
         public QueueOptions RetryQueue { get; set; } = new();
 
@@ -49,10 +49,11 @@ namespace RabbitSharp.Options
         /// <remarks>
         /// A blank queue name is not an empty name to AMQP: in <c>queue.bind</c> and
         /// <c>basic.consume</c> it means "the last queue declared on this channel". The declares run
-        /// main queue, dead-letter queue, then one retry queue per delay, so a blank main queue name
-        /// makes the binding and the consumer silently attach to a retry queue while the queue the
-        /// subscription was meant to serve is a server-named one nothing is bound to. The
-        /// subscription comes up and consumes the wrong queue, and nothing throws.
+        /// main queue, dead-letter queue, then the retry queue (when one is declared at all - see
+        /// <see cref="RetryStrategy"/>), so a blank main queue name makes the binding and the consumer
+        /// silently attach to another queue while the queue the subscription was meant to serve is a
+        /// server-named one nothing is bound to. The subscription comes up and consumes the wrong
+        /// queue, and nothing throws.
         /// </remarks>
         /// <exception cref="ArgumentException">Thrown when a required queue name is missing.</exception>
         /// <exception cref="ArgumentNullException">
@@ -66,7 +67,7 @@ namespace RabbitSharp.Options
                 throw new ArgumentException(
                     "BusInfrastructureOptions.MainQueue.QueueName must be provided. A blank name means " +
                     "\"the last queue declared on this channel\" to AMQP, so the binding and the consumer " +
-                    "would silently attach to one of the retry queues instead.",
+                    "would silently attach to another queue instead.",
                     nameof(MainQueue));
 
             if (string.IsNullOrWhiteSpace(DeadLetterQueue.QueueName))
@@ -76,10 +77,13 @@ namespace RabbitSharp.Options
                     "message to the default exchange with no routing key, where the broker drops it.",
                     nameof(DeadLetterQueue));
 
-            if (busResilience.MaxDeliveryRetryAttempts > 0 && string.IsNullOrWhiteSpace(RetryQueue.QueueName))
+            if (busResilience.MaxDeliveryRetryAttempts > 0
+                && busResilience.Strategy == RetryStrategy.RetryQueue
+                && string.IsNullOrWhiteSpace(RetryQueue.QueueName))
                 throw new ArgumentException(
                     "BusInfrastructureOptions.RetryQueue.QueueName must be provided when " +
-                    "BusResilienceOptions.MaxDeliveryRetryAttempts is greater than zero.",
+                    "BusResilienceOptions.MaxDeliveryRetryAttempts is greater than zero and " +
+                    "BusResilienceOptions.Strategy is RetryStrategy.RetryQueue.",
                     nameof(RetryQueue));
         }
     }

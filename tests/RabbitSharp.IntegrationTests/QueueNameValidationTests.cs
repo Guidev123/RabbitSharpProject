@@ -7,10 +7,11 @@ namespace RabbitSharp.IntegrationTests
     /// <summary>
     /// An empty queue name is not an empty name to AMQP - it means "the last queue declared on this
     /// channel". <c>DeclareInfrastructureAsync</c> declares the main queue, the dead-letter queue and
-    /// then one retry queue per delay, so the last declared queue is a retry queue: the bind and the
-    /// consume that follow silently attach to that instead. The subscription comes up, consumes from
-    /// the retry queue, and the main queue it was supposed to serve is a server-named queue nothing
-    /// is bound to. Nothing throws, which is the worst part.
+    /// then the retry queue (under <c>RetryStrategy.RetryQueue</c>), so the last declared queue would
+    /// be a retry queue: the bind and the consume that follow would silently attach to that instead.
+    /// The subscription would come up, consume from the retry queue, and the main queue it was
+    /// supposed to serve would be a server-named queue nothing is bound to - which is why
+    /// <c>Validate</c> rejects a blank name before any of this is declared.
     /// </summary>
     public class QueueNameValidationTests : IClassFixture<RabbitMqContainerFixture>
     {
@@ -36,10 +37,9 @@ namespace RabbitSharp.IntegrationTests
                 () => bus.SubscribeAsync<ValidationEvent>(queueName, _ => Task.CompletedTask));
 
             // The regression: the derived names were built off the blank one, so the broker ended up
-            // with a ".deadletter" and a ".retry.1000ms" queue, and the consumer was attached to the
-            // latter.
+            // with a ".deadletter" and a ".retry" queue, and the consumer was attached to the latter.
             Assert.False(await _fixture.QueueExistsAsync(".deadletter"), "a dead-letter queue was declared for a blank queue name.");
-            Assert.False(await _fixture.QueueExistsAsync(".retry.1000ms"), "a retry queue was declared for a blank queue name.");
+            Assert.False(await _fixture.QueueExistsAsync(".retry"), "a retry queue was declared for a blank queue name.");
         }
 
         [Fact]

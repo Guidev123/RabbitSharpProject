@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using RabbitSharp.Abstractions;
+using RabbitSharp.Options;
 using Xunit;
 
 namespace RabbitSharp.IntegrationTests
@@ -38,9 +39,9 @@ namespace RabbitSharp.IntegrationTests
                 configureBroker: b => b.NetworkRecoveryIntervalInSeconds = 60,
                 configureResilience: r =>
                 {
+                    r.Strategy = RetryStrategy.RetryQueue;
                     r.MaxDeliveryRetryAttempts = 3;
                     r.InitialDeliveryRetryDelay = TimeSpan.FromMilliseconds(200);
-                    r.MaxDeliveryRetryDelay = TimeSpan.FromSeconds(1);
                 },
                 configureServices: s => s.AddLogging(b => b.AddProvider(logs)));
 
@@ -92,7 +93,7 @@ namespace RabbitSharp.IntegrationTests
 
             // The broker requeues what was never acked, so the message is still there to be
             // redelivered - it was not copied onto the retry path, and nothing was lost.
-            Assert.Equal(0u, await _fixture.GetQueueDepthAsync($"{queueName}.retry.200ms"));
+            Assert.Equal(0u, await _fixture.GetQueueDepthAsync($"{queueName}.retry"));
             Assert.Equal(0u, await _fixture.GetQueueDepthAsync($"{queueName}.deadletter"));
             Assert.Equal(1u, await _fixture.GetQueueDepthAsync(queueName));
 

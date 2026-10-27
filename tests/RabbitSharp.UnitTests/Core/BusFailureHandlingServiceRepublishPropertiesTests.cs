@@ -96,6 +96,22 @@ namespace RabbitSharp.UnitTests.Core
             Assert.Null(republished.UserId);
         }
 
+        /// <summary>
+        /// Used only for a RetryStrategy.RetryQueue publish: the delay is carried per message instead
+        /// of as a fixed queue argument, so the retry queue can be redeclared after the configured
+        /// delay changes without the broker rejecting it with 406 PRECONDITION_FAILED.
+        /// </summary>
+        [Fact]
+        public void BuildRepublishProperties_WithExpirationMs_SetsExpirationToThatDelay()
+        {
+            var source = Produced();
+            source.Expiration = "60000";
+
+            var republished = BusFailureHandlingService.BuildRepublishProperties(source, Headers(), expirationMs: 2000);
+
+            Assert.Equal("2000", republished.Expiration);
+        }
+
         [Fact]
         public void BuildRepublishProperties_WithAnEmptyOriginal_CarriesOnlyWhatItSets()
         {
