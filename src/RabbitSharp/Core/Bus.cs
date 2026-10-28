@@ -68,7 +68,7 @@ namespace RabbitSharp.Core
 
         public event Func<SubscriptionInterruptedEventArgs, Task>? SubscriptionInterrupted;
 
-        public Task PublishAsync<T>(T message, CancellationToken cancellationToken = default) where T : IMessage
+        public Task PublishAsync<T>(T message, CancellationToken cancellationToken = default) where T : class
         {
             ArgumentNullException.ThrowIfNull(message);
 
@@ -85,7 +85,7 @@ namespace RabbitSharp.Core
         /// nothing but a <see cref="Type"/>, and the subscribe path has always asked them exactly once
         /// per subscription.
         /// </remarks>
-        private PublisherOptions GetConventionPublisherOptions<T>() where T : IMessage
+        private PublisherOptions GetConventionPublisherOptions<T>() where T : class
         {
             if (_conventionPublisherOptions.TryGetValue(typeof(T), out var cached))
             {
@@ -106,7 +106,7 @@ namespace RabbitSharp.Core
             return _conventionPublisherOptions.GetOrAdd(typeof(T), options);
         }
 
-        public async Task PublishAsync<T>(PublisherOptions options, T message, CancellationToken cancellationToken = default) where T : IMessage
+        public async Task PublishAsync<T>(PublisherOptions options, T message, CancellationToken cancellationToken = default) where T : class
         {
             ArgumentNullException.ThrowIfNull(options);
             ArgumentNullException.ThrowIfNull(message);
@@ -132,10 +132,12 @@ namespace RabbitSharp.Core
                 declaredOnThisChannel.TryAdd(declaration, 0);
             }
 
+            var correlationId = MessageCorrelationIdAccessor.Get(message);
+
             var body = JsonSerializer.SerializeToUtf8Bytes(message, _busMessagingOptions.SerializerOptions);
             var properties = new BasicProperties
             {
-                MessageId = message.CorrelationId.ToString(),
+                MessageId = correlationId.ToString(),
                 Persistent = true,
                 Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds()),
                 Headers = options.Headers
@@ -143,10 +145,10 @@ namespace RabbitSharp.Core
 
             await channel.BasicPublishAsync(exchangeName, options.RoutingKey!, true, properties, body, cancellationToken);
 
-            LogPublished(typeof(T).Name, message.CorrelationId, exchangeName);
+            LogPublished(typeof(T).Name, correlationId, exchangeName);
         }
 
-        public async Task SubscribeAsync<T>(string queueName, Func<T, Task> onMessage, CancellationToken cancellationToken = default) where T : IMessage
+        public async Task SubscribeAsync<T>(string queueName, Func<T, Task> onMessage, CancellationToken cancellationToken = default) where T : class
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(queueName);
             ArgumentNullException.ThrowIfNull(onMessage);
@@ -166,7 +168,7 @@ namespace RabbitSharp.Core
             await SubscribeAsync(options, onMessage, cancellationToken);
         }
 
-        public async Task SubscribeAsync<T>(BusInfrastructureOptions options, Func<T, Task> onMessage, CancellationToken cancellationToken = default) where T : IMessage
+        public async Task SubscribeAsync<T>(BusInfrastructureOptions options, Func<T, Task> onMessage, CancellationToken cancellationToken = default) where T : class
         {
             ArgumentNullException.ThrowIfNull(options);
             ArgumentNullException.ThrowIfNull(onMessage);
@@ -216,7 +218,7 @@ namespace RabbitSharp.Core
             BusInfrastructureOptions options,
             IChannel channel,
             Func<T, Task> onMessage,
-            CancellationToken cancellationToken) where T : IMessage
+            CancellationToken cancellationToken) where T : class
         {
             var deliveryTag = eventArgs.DeliveryTag;
             var queueName = options.MainQueue.QueueName;
@@ -244,18 +246,20 @@ namespace RabbitSharp.Core
                 return;
             }
 
-            if (_busMessagingOptions.RejectMessagesWithEmptyCorrelationId && message.CorrelationId == Guid.Empty)
+            var messageCorrelationId = MessageCorrelationIdAccessor.Get(message);
+
+            if (_busMessagingOptions.RejectMessagesWithEmptyCorrelationId && messageCorrelationId == Guid.Empty)
             {
                 LogEmptyCorrelationId(correlationId, queueName);
                 await DeadLetterAndAckOrStopSubscriptionAsync(eventArgs, options, channel, correlationId, retryCount: 0, cancellationToken);
                 return;
             }
 
-            LogReceived(typeof(T).Name, message.CorrelationId, queueName);
+            LogReceived(typeof(T).Name, messageCorrelationId, queueName);
 
             if (_busResilienceOptions.Strategy == RetryStrategy.InMemory)
             {
-                await HandleDeliveryWithInMemoryRetryAsync(message, eventArgs, options, channel, onMessage, correlationId, cancellationToken);
+                await HandleDeliveryWithInMemoryRetryAsync(message, messageCorrelationId, eventArgs, options, channel, onMessage, correlationId, cancellationToken);
                 return;
             }
 
@@ -270,7 +274,7 @@ namespace RabbitSharp.Core
                 return;
             }
 
-            await AckAndLogAsync(channel, deliveryTag, correlationId, queueName, typeof(T).Name, message.CorrelationId);
+            await AckAndLogAsync(channel, deliveryTag, correlationId, queueName, typeof(T).Name, messageCorrelationId);
         }
 
         /// <summary>
@@ -282,20 +286,30 @@ namespace RabbitSharp.Core
         /// succeeds and dead-lettered (with an ack) once retries are exhausted.
         /// </summary>
         /// <remarks>
-        /// A cancellation during the backoff delay - the subscription is stopping - nacks the delivery
-        /// with requeue instead of continuing to retry or dead-lettering it. The attempt count made so
-        /// far is not durable anywhere (there is no republish to carry an <c>x-retry-count</c> header),
-        /// so a requeued delivery is retried from attempt 0 the next time it is delivered, whether
-        /// that is to this process after a restart or to another consumer of the same queue.
+        /// A cancellation during the backoff delay stops retrying or dead-lettering, and does *not*
+        /// nack the delivery itself. <see cref="Task.Delay(int, CancellationToken)"/> can only be
+        /// cancelled here because <paramref name="cancellationToken"/> is cancelable, and
+        /// <c>RegisterActiveConsumer</c> registers a callback on that same cancelable token that is
+        /// already closing this delivery's channel concurrently with this one - so nacking here too
+        /// would race that close instead of depending on it. A channel close requeues every delivery
+        /// still unacknowledged on it, which is what actually puts this one back on the queue, without
+        /// the race a second, independent nack would add: both operations reaching the broker in
+        /// whichever order, the nack landing first would requeue the message onto a consumer that has
+        /// not been cancelled yet and get it redelivered - and reprocessed - a second time before the
+        /// close finally lands. The attempt count made so far is not durable anywhere (there is no
+        /// republish to carry an <c>x-retry-count</c> header), so the requeued delivery is retried from
+        /// attempt 0 the next time it is delivered, whether that is to this process after a restart or
+        /// to another consumer of the same queue.
         /// </remarks>
         private async Task HandleDeliveryWithInMemoryRetryAsync<T>(
             T message,
+            Guid messageCorrelationId,
             BasicDeliverEventArgs eventArgs,
             BusInfrastructureOptions options,
             IChannel channel,
             Func<T, Task> onMessage,
             string correlationId,
-            CancellationToken cancellationToken) where T : IMessage
+            CancellationToken cancellationToken) where T : class
         {
             var deliveryTag = eventArgs.DeliveryTag;
             var queueName = options.MainQueue.QueueName;
@@ -329,7 +343,6 @@ namespace RabbitSharp.Core
                     catch (OperationCanceledException)
                     {
                         LogInMemoryRetryCancelled(correlationId, queueName);
-                        await HoldBackForRedeliveryAsync(channel, deliveryTag, correlationId, queueName);
                         return;
                     }
 
@@ -337,7 +350,7 @@ namespace RabbitSharp.Core
                 }
             }
 
-            await AckAndLogAsync(channel, deliveryTag, correlationId, queueName, typeof(T).Name, message.CorrelationId);
+            await AckAndLogAsync(channel, deliveryTag, correlationId, queueName, typeof(T).Name, messageCorrelationId);
         }
 
         private async Task HandleFailedDeliveryViaRetryQueueAsync(
@@ -486,10 +499,8 @@ namespace RabbitSharp.Core
         }
 
         /// <summary>
-        /// Nacks the delivery with requeue, without stopping the subscription. Used when the backoff
-        /// delay of <see cref="RetryStrategy.InMemory"/> is cancelled because the subscription is
-        /// already stopping on its own - cancellation already drives that shutdown elsewhere, so there
-        /// is nothing left for this call to trigger.
+        /// Nacks the delivery with requeue, without stopping the subscription - the caller is already
+        /// about to do that itself.
         /// </summary>
         private async Task HoldBackForRedeliveryAsync(
             IChannel channel,
@@ -896,7 +907,7 @@ namespace RabbitSharp.Core
         [LoggerMessage(EventId = 19, Level = LogLevel.Warning, Message = "Message {CorrelationId} from queue {QueueName} failed; retrying in-process after {DelayMs}ms (attempt {RetryCount}/{MaxDeliveryRetryAttempts})")]
         private partial void LogInMemoryRetry(string correlationId, string queueName, int delayMs, int retryCount, int maxDeliveryRetryAttempts);
 
-        [LoggerMessage(EventId = 20, Level = LogLevel.Warning, Message = "The in-process retry backoff for message {CorrelationId} from queue {QueueName} was cancelled; the delivery was requeued and will be retried from attempt 0 on its next delivery")]
+        [LoggerMessage(EventId = 20, Level = LogLevel.Warning, Message = "The in-process retry backoff for message {CorrelationId} from queue {QueueName} was cancelled; the subscription is closing its channel, which will requeue this delivery to be retried from attempt 0 the next time it is delivered")]
         private partial void LogInMemoryRetryCancelled(string correlationId, string queueName);
     }
 }

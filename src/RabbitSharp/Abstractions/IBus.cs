@@ -20,7 +20,8 @@ namespace RabbitSharp.Abstractions
         /// Publishes a message to the bus using the default configuration.
         /// </summary>
         /// <typeparam name="T">
-        /// The message type. Must implement <see cref="IMessage"/>.
+        /// The message type - any reference type exposing a public <c>Guid CorrelationId { get; }</c>
+        /// property. Implementing <see cref="IMessage"/> is an optional convenience, not a requirement.
         /// </typeparam>
         /// <param name="message">
         /// The message instance to publish. Cannot be <see langword="null"/>.
@@ -32,13 +33,14 @@ namespace RabbitSharp.Abstractions
         /// Thrown if <paramref name="message"/> is <see langword="null"/>.
         /// </exception>
         Task PublishAsync<T>(T message, CancellationToken cancellationToken = default)
-            where T : IMessage;
+            where T : class;
 
         /// <summary>
         /// Publishes a message with custom publisher settings, including exchange, routing, and delivery options.
         /// </summary>
         /// <typeparam name="T">
-        /// The message type. Must implement <see cref="IMessage"/>.
+        /// The message type - any reference type exposing a public <c>Guid CorrelationId { get; }</c>
+        /// property. Implementing <see cref="IMessage"/> is an optional convenience, not a requirement.
         /// </typeparam>
         /// <param name="options">
         /// Publisher configuration, such as exchange type, routing key, and durability.
@@ -53,13 +55,14 @@ namespace RabbitSharp.Abstractions
         /// Thrown if <paramref name="options"/> or <paramref name="message"/> is <see langword="null"/>.
         /// </exception>
         Task PublishAsync<T>(PublisherOptions options, T message, CancellationToken cancellationToken = default)
-             where T : IMessage;
+             where T : class;
 
         /// <summary>
         /// Subscribes to a queue and processes messages of type <typeparamref name="T"/> using a specified handler.
         /// </summary>
         /// <typeparam name="T">
-        /// The message type. Must implement <see cref="IMessage"/>.
+        /// The message type - any reference type exposing a public <c>Guid CorrelationId { get; }</c>
+        /// property. Implementing <see cref="IMessage"/> is an optional convenience, not a requirement.
         /// </typeparam>
         /// <param name="queueName">
         /// The target queue name.
@@ -71,14 +74,15 @@ namespace RabbitSharp.Abstractions
         /// Optional cancellation token to stop the subscription.
         /// </param>
         Task SubscribeAsync<T>(string queueName, Func<T, Task> onMessage, CancellationToken cancellationToken = default)
-            where T : IMessage;
+            where T : class;
 
         /// <summary>
         /// Subscribes to a queue with full infrastructure configuration (exchange, bindings, DLQ, retry, etc.)
         /// and processes messages of type <typeparamref name="T"/>.
         /// </summary>
         /// <typeparam name="T">
-        /// The message type. Must implement <see cref="IMessage"/>.
+        /// The message type - any reference type exposing a public <c>Guid CorrelationId { get; }</c>
+        /// property. Implementing <see cref="IMessage"/> is an optional convenience, not a requirement.
         /// </typeparam>
         /// <param name="options">
         /// Complete bus infrastructure configuration for this subscription.
@@ -90,6 +94,6 @@ namespace RabbitSharp.Abstractions
         /// Optional cancellation token to stop the subscription.
         /// </param>
         Task SubscribeAsync<T>(BusInfrastructureOptions options, Func<T, Task> onMessage, CancellationToken cancellationToken = default)
-           where T : IMessage;
+           where T : class;
     }
 }

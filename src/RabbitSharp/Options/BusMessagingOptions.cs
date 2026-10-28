@@ -30,14 +30,14 @@ namespace RabbitSharp.Options
         };
 
         /// <summary>
-        /// When <see langword="true"/> (the default), a message that deserializes with
-        /// <see cref="Abstractions.IMessage.CorrelationId"/> equal to <see cref="Guid.Empty"/> is treated
-        /// as an unreadable payload and dead-lettered instead of being handed to the handler and acked
-        /// as processed - the usual symptom of a payload whose property names did not bind.
+        /// When <see langword="true"/> (the default), a message that deserializes with its
+        /// <c>CorrelationId</c> property equal to <see cref="Guid.Empty"/> is treated as an unreadable
+        /// payload and dead-lettered instead of being handed to the handler and acked as processed -
+        /// the usual symptom of a payload whose property names did not bind.
         /// True is the safe default precisely because a producer cannot be trusted to always populate
-        /// <see cref="Abstractions.IMessage.CorrelationId"/> correctly - an empty one is the most
-        /// reliable signal available that a payload never bound. Set this to <see langword="false"/>
-        /// only for a message type that legitimately never carries a meaningful correlation id.
+        /// <c>CorrelationId</c> correctly - an empty one is the most reliable signal available that a
+        /// payload never bound. Set this to <see langword="false"/> only for a message type that
+        /// legitimately never carries a meaningful correlation id.
         /// </summary>
         public bool RejectMessagesWithEmptyCorrelationId { get; set; } = true;
 

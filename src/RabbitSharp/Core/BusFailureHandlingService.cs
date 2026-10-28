@@ -26,7 +26,7 @@ namespace RabbitSharp.Core
             BusInfrastructureOptions options,
             BusResilienceOptions busResilience,
             IChannel channel,
-            CancellationToken cancellationToken = default) where T : IMessage
+            CancellationToken cancellationToken = default) where T : class
         {
             if (string.IsNullOrEmpty(options.Exchange.ExchangeName))
             {

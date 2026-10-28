@@ -16,7 +16,9 @@ namespace RabbitSharp.Core
         /// for a given message type within the specified bus configuration.
         /// </summary>
         /// <typeparam name="T">
-        /// The type of message for which to declare infrastructure. Must implement <see cref="IMessage"/>.
+        /// The type of message for which to declare infrastructure - any reference type exposing a
+        /// public <c>Guid CorrelationId { get; }</c> property. Implementing <see cref="IMessage"/> is
+        /// an optional convenience, not a requirement.
         /// </typeparam>
         /// <param name="options">
         /// The bus infrastructure configuration, including exchange and queue definitions.
@@ -37,7 +39,7 @@ namespace RabbitSharp.Core
             BusResilienceOptions busResilience,
             IChannel channel,
             CancellationToken cancellationToken = default)
-            where T : IMessage;
+            where T : class;
 
         /// <summary>
         /// Retrieves the number of retry attempts for a given message based on its properties.

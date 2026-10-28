@@ -18,6 +18,12 @@ A highly customizable RabbitMQ Pub/Sub library for .NET 8+ applications with bui
 - ✅ Convention-based naming with customizable overrides
 - ✅ Configurable JSON serialization, case-insensitive by default
 - ✅ Pre-configured setups for different environments
+- ✅ No interface required on message contracts - a plain class or record with a `CorrelationId`
+  property works, so a shared contracts project never needs to reference RabbitSharp
+- ✅ `appsettings.json` support - `AddRabbitSharp(configuration)` binds every options type from
+  configuration, with code-based overrides layered on top
+- ✅ Multiple virtual hosts (or brokers) from the same application - `AddRabbitSharp(name, ...)`
+  registers an additional, independently configured bus resolved through keyed DI
 
 ## Installation
 
@@ -39,34 +45,73 @@ dotnet add package RabbitSharp
     "Username": "guest",
     "Password": "guest",
     "VirtualHost": "/"
+  },
+  "BusResilienceOptions": {
+    "MaxDeliveryRetryAttempts": 3,
+    "InitialDeliveryRetryDelay": "00:00:01",
+    "MaxDeliveryRetryDelay": "00:00:10"
+  },
+  "BusMessagingOptions": {
+    "DefaultExchangeType": "Topic"
   }
 }
 ```
 
+`BusResilienceOptions` and `BusMessagingOptions` are optional - a missing section just leaves that
+options type at its own defaults.
+
 2. Register RabbitSharp in Program.cs
+
+The simplest way is to hand `AddRabbitSharp` your `IConfiguration` directly - it binds
+`BrokerOptions`, `BusResilienceOptions` and `BusMessagingOptions` from the sections named after each
+type (`BrokerOptions`, `BusResilienceOptions`, `BusMessagingOptions`), the same names used throughout
+this README and in the appsettings.json above:
+
 ```csharp
-var brokerOptions = builder.Configuration.GetSection(nameof(BrokerOptions)).Get<BrokerOptions>() ?? new BrokerOptions();
-builder.Services.AddRabbitSharp(options =>
-{
-    options.Username = brokerOptions.Username;
-    options.Password = brokerOptions.Password;
-    options.VirtualHost = brokerOptions.VirtualHost;
-    options.Hosts = brokerOptions.Hosts;
-});
+builder.Services.AddRabbitSharp(builder.Configuration);
 ```
 
 `AddRabbitSharp` must be called exactly once per `IServiceCollection`: a second call throws instead of
 validating its configuration and then silently keeping the first one.
 
-With Resilience Configuration:
+A section that is missing leaves that options type at its own defaults - and for `BrokerOptions`,
+whose `Hosts`/`Username`/`Password` have no sensible default, that still fails validation the same way
+an empty lambda would, with the same message. Pass `configureBroker`/`configureResilience`/
+`configureMessaging` delegates to layer code-based configuration *on top of* what was bound from
+configuration - handy for a secret that should not live in `appsettings.json`, since the delegate runs
+after binding and has the last word:
+
 ```csharp
-var brokerOptions = builder.Configuration.GetSection(nameof(BrokerOptions)).Get<BrokerOptions>() ?? new BrokerOptions();
+builder.Services.AddRabbitSharp(
+    builder.Configuration,
+    configureBroker: broker =>
+    {
+        // Overrides whatever BrokerOptions:Password bound from appsettings.json, if anything.
+        broker.Password = builder.Configuration["BrokerPasswordSecret"] ?? broker.Password;
+    },
+    configureResilience: resilience =>
+    {
+        // Default is RetryStrategy.InMemory - see "Retry Strategies" below.
+        resilience.Strategy = RetryStrategy.RetryQueue;
+    });
+```
+
+A non-default section name works too, e.g. for a shared appsettings.json where `BrokerOptions` is
+nested somewhere else:
+
+```csharp
+builder.Services.AddRabbitSharp(builder.Configuration, brokerSectionName: "Messaging:Broker");
+```
+
+Everything above also works built up entirely in code, with no `IConfiguration` involved at all -
+useful for a console app, a test host, or values that do not come from configuration:
+
+```csharp
 builder.Services.AddRabbitSharp(options =>
 {
-    options.Username = brokerOptions.Username;
-    options.Password = brokerOptions.Password;
-    options.VirtualHost = brokerOptions.VirtualHost;
-    options.Hosts = brokerOptions.Hosts;
+    options.Hosts = new[] { "localhost" };
+    options.Username = "guest";
+    options.Password = "guest";
 }, busResilienceOptions =>
 {
     busResilienceOptions.InitialDeliveryRetryDelay = TimeSpan.FromSeconds(1);
@@ -75,15 +120,7 @@ builder.Services.AddRabbitSharp(options =>
 
     // Default is RetryStrategy.InMemory - see "Retry Strategies" below.
     busResilienceOptions.Strategy = RetryStrategy.InMemory;
-});
-```
-
-With Messaging Configuration (serialization and the convention-based exchange type):
-```csharp
-builder.Services.AddRabbitSharp(options =>
-{
-    // broker options
-}, busResilienceOptions: null, busMessagingOptions: messaging =>
+}, busMessagingOptions: messaging =>
 {
     // Both convention-based overloads use this type, and they must agree with each other.
     messaging.DefaultExchangeType = ExchangeTypeEnum.Fanout;
@@ -118,6 +155,10 @@ public class EventSimple : IMessage
     public Guid CorrelationId { get; init; }
 }
 ```
+
+`IMessage` is optional - see [Message Requirements](#message-requirements) below. A project that only
+defines message contracts (shared between a producer and its consumers) does not need to reference
+RabbitSharp at all for this.
 
 4. Publish messages
 
@@ -168,15 +209,32 @@ var eventSimple = new EventSimple(Guid.NewGuid());
 await bus.PublishAsync(options, eventSimple);
 ```
 
-Message Requirements
+## Message Requirements
+
+Every `PublishAsync`/`SubscribeAsync` overload only needs the message type to be a reference type
+exposing a public `Guid CorrelationId { get; }` property, read by convention at runtime rather than
+through an interface:
+
 ```csharp
-public sealed record YourMessage : IMessage
+public sealed record YourMessage
 {
     public Guid CorrelationId { get; init; }
-    
+
     // Your message properties here
 }
 ```
+
+`IMessage` still exists and keeps working for anyone who implements it - it is a purely compile-time
+convenience (it documents the property and catches a missing one at build time) - but it is not
+required. This is what lets a project that only defines message contracts, shared between a producer
+and its consumers, skip a reference to RabbitSharp - and everything it pulls in (RabbitMQ.Client,
+logging abstractions, ...) - entirely: a plain class or record with that one property is a valid
+RabbitSharp message on its own, with no `RabbitSharp.Abstractions` package of any kind to add.
+
+The price of dropping the interface is the compile-time guarantee: a message type missing the
+property compiles fine and only fails the first time it is actually published or consumed, with an
+`InvalidOperationException` naming the type and the property it is missing. That check is also cached
+per type, so it never repeats the reflection lookup once a type has been validated.
 
 5. Subscribing to Messages
 Basic Subscription (Convention-Based)
@@ -244,6 +302,58 @@ This fires only for a subscription that will *not* come back on its own, so re-s
 safe. A dropped connection is not one of those cases: RabbitMQ.Client's automatic recovery
 re-registers the consumer itself, which is logged but raises no event - re-subscribing there would
 add a second consumer to the queue on every network blip.
+
+## Multiple Virtual Hosts or Brokers
+
+A RabbitMQ virtual host is pinned to a connection for that connection's whole lifetime at the AMQP
+protocol level, so serving more than one from the same application always means more than one
+physical connection - there is no way around that. `AddRabbitSharp(name, ...)` registers an
+additional, independently configured bus under `name`, so each virtual host (or broker) gets its own
+connection without touching the unnamed registration at all:
+
+```csharp
+builder.Services.AddRabbitSharp(broker =>
+{
+    broker.Hosts = ["localhost"];
+    broker.VirtualHost = "/";
+    broker.Username = "guest";
+    broker.Password = "guest";
+});
+
+builder.Services.AddRabbitSharp("billing", broker =>
+{
+    broker.Hosts = ["localhost"];
+    broker.VirtualHost = "billing";
+    broker.Username = "guest";
+    broker.Password = "guest";
+});
+```
+
+It also works with `IConfiguration`, binding by default from a section named after `name`
+(`"billing:BrokerOptions"`, `"billing:BusResilienceOptions"`, `"billing:BusMessagingOptions"`), so
+several virtual hosts can each have their own section in the same `appsettings.json`:
+
+```csharp
+builder.Services.AddRabbitSharp("billing", builder.Configuration);
+```
+
+A named bus is resolved by its name through keyed DI instead of `GetRequiredService<IBus>()`:
+
+```csharp
+public sealed class BillingConsumer([FromKeyedServices("billing")] IBus billingBus)
+{
+}
+```
+
+```csharp
+var billingBus = serviceProvider.GetRequiredKeyedService<IBus>("billing");
+```
+
+Calling `AddRabbitSharp(name, ...)` twice with the same name throws, the same way calling the unnamed
+overload twice does; two different names coexist freely, and so does mixing one unnamed call with any
+number of named ones. `INamingConventions` and the dead-letter/retry failure-handling service stay
+shared across every bus, named or not - both are stateless, so there is nothing to gain from a copy
+per bus.
 
 ## Environment-Specific Presets
 RabbitSharp provides pre-configured setups for different scenarios:
